@@ -49,3 +49,6 @@ Thumbs.db
 
 # Jupyter Notebooks
 .ipynb_checkpoints
+
+# GIS
+CLAUDE.md

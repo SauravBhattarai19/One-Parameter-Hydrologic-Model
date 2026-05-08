@@ -91,10 +91,36 @@ def perform_hydrological_analysis(dem_path, output_point_latlon, target_crs_epsg
     filled_dem = grid.fill_depressions(dem)
     # Resolve flats to ensure all areas drain
     inflated_dem = grid.resolve_flats(filled_dem)
-    
+
     with rasterio.open(os.path.join(OUTPUT_DIR, "filled_dem.tif"), 'w', **profile) as dst:
         dst.write(np.asarray(filled_dem), 1)
     print(f"Filled DEM saved to: {os.path.join(OUTPUT_DIR, 'filled_dem.tif')}")
+
+    # Save the hydrologically conditioned DEM (fill + resolve_flats).
+    #
+    # Why float32 matters for INTEGER source DEMs (e.g. SRTM int16):
+    #   resolve_flats adds sub-metre increments (e.g. +0.001 m) to flat cells
+    #   so the D8 algorithm can assign unambiguous flow directions.  If the file
+    #   is written back as int16, those increments round to zero and the flat
+    #   areas look slope-less again in the router → water pools → delayed surge.
+    #   Saving as float32 preserves the increments exactly.
+    #
+    # If the source DEM is already floating-point the dtype is kept as-is;
+    # the float32 upgrade only activates for integer-typed inputs.
+    src_dtype = profile.get('dtype', 'float32')
+    is_int_dem = np.dtype(src_dtype).kind in ('i', 'u')   # signed/unsigned int
+    save_dtype = 'float32' if is_int_dem else src_dtype
+    inflated_arr = np.asarray(inflated_dem).astype(save_dtype)
+    # Replace any NaN or original nodata with a safe sentinel
+    orig_nodata = profile.get('nodata')
+    if orig_nodata is not None:
+        inflated_arr[inflated_arr == np.array(orig_nodata, dtype=save_dtype)] = -9999.0
+    inflated_arr[~np.isfinite(inflated_arr)] = -9999.0
+    inflated_profile = profile.copy()
+    inflated_profile.update(dtype=save_dtype, nodata=-9999.0)
+    with rasterio.open(os.path.join(OUTPUT_DIR, "inflated_dem.tif"), 'w', **inflated_profile) as dst:
+        dst.write(inflated_arr, 1)
+    print(f"Inflated DEM (float32) saved to: {os.path.join(OUTPUT_DIR, 'inflated_dem.tif')}")
 
     # 2. Flow direction
     print("Calculating flow direction...")
@@ -135,8 +161,12 @@ def perform_hydrological_analysis(dem_path, output_point_latlon, target_crs_epsg
         print("Warning: Output point is outside the DEM's bounds. Watershed delineation might fail or be empty.")
         
     print("Snapping outlet point to nearest stream cell...")
-    # Define stream mask: cells with high accumulation
-    stream_threshold = 1000
+    # Stream threshold: top 1 % of cells by accumulation, minimum 1.
+    # A fixed value (e.g. 1000) fails on coarse or small DEMs where total
+    # cell count is less than the threshold, leaving the stream mask empty.
+    n_cells_total = int(flow_accumulation.size)
+    stream_threshold = max(1, n_cells_total // 100)
+    print(f"  Stream threshold: {stream_threshold} cells  (1 % of {n_cells_total} total)")
     streams = flow_accumulation > stream_threshold
     
     # Use pysheds built-in snap_to_mask: works in projected coordinate space
@@ -172,21 +202,27 @@ def perform_hydrological_analysis(dem_path, output_point_latlon, target_crs_epsg
 
     return filled_dem, watershed, flow_accumulation, profile
 
-def clip_dem_by_watershed(original_dem_path, watershed_raster, output_clipped_dem_path, dem_profile):
+def clip_dem_by_watershed(original_dem_path, watershed_raster, output_clipped_dem_path,
+                          dem_profile, nodata_fill=None):
     """
     Clips the original DEM by the delineated watershed boundary.
+
+    nodata_fill : value written to outside-watershed pixels.  Defaults to
+                  dem_profile['nodata'].  Pass explicitly when the source file
+                  uses a different nodata convention (e.g. float32 with -9999).
     """
     print(f"Clipping DEM: {original_dem_path} by watershed...")
+    if nodata_fill is None:
+        nodata_fill = dem_profile['nodata']
+
     with rasterio.open(original_dem_path) as src:
         dem_data = src.read(1)
-        # Set pixels outside the watershed to nodata
-        clipped_dem_data = np.where(np.asarray(watershed_raster) > 0, dem_data, dem_profile['nodata'])
-        
-        # Update profile for clipped DEM
+        clipped_dem_data = np.where(np.asarray(watershed_raster) > 0, dem_data, nodata_fill)
+
         clipped_profile = dem_profile.copy()
         clipped_profile.update(
             dtype=clipped_dem_data.dtype,
-            nodata=dem_profile['nodata']
+            nodata=nodata_fill,
         )
 
         with rasterio.open(output_clipped_dem_path, 'w', **clipped_profile) as dst:
@@ -227,11 +263,14 @@ def main():
     # Perform hydrological analysis
     filled_dem, watershed, flow_accumulation, dem_profile = perform_hydrological_analysis(reprojected_dem_path, OUTPUT_POINT_LATLON, TARGET_CRS_EPSG)
 
-    # Clip DEM by watershed — use the filled (hydrologically conditioned) DEM
-    # so that slopes are consistent with the flow direction / accumulation grids.
-    filled_dem_path  = os.path.join(OUTPUT_DIR, "filled_dem.tif")
-    clipped_dem_path = os.path.join(OUTPUT_DIR, "clipped_dem.tif")
-    clip_dem_by_watershed(filled_dem_path, watershed, clipped_dem_path, dem_profile)
+    # Clip DEM by watershed — use the inflated (fill + resolve_flats, float32) DEM
+    # so that slopes preserve the sub-metre gradients from resolve_flats.
+    # The integer filled_dem rounds those increments to zero, collapsing flat
+    # areas to slope=0 and causing a delayed drainage surge in the router.
+    inflated_dem_path = os.path.join(OUTPUT_DIR, "inflated_dem.tif")
+    clipped_dem_path  = os.path.join(OUTPUT_DIR, "clipped_dem.tif")
+    clip_dem_by_watershed(inflated_dem_path, watershed, clipped_dem_path,
+                          dem_profile, nodata_fill=-9999.0)
 
     # Clip flow accumulation (contributing area) by watershed
     clipped_fa_path = os.path.join(OUTPUT_DIR, "clipped_flow_accumulation.tif")

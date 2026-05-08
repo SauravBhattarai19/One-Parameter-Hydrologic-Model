@@ -62,6 +62,13 @@ def load_rasters(cfg):
         dem        = src.read(1).astype(np.float64)
         nodata_dem = src.nodata
         transform  = src.transform
+        # Cell size: use config override if set, otherwise derive from transform.
+        # transform.a = pixel width (x), transform.e = pixel height (negative).
+        # For square pixels in a projected CRS both magnitudes are equal.
+        if getattr(cfg, 'CELL_SIZE', None) is not None:
+            cell_size = float(cfg.CELL_SIZE)
+        else:
+            cell_size = float(abs(transform.a))
 
     with rasterio.open(cfg.ROUTING_FLOW_DIR_PATH) as src:
         fdir = src.read(1)
@@ -80,8 +87,9 @@ def load_rasters(cfg):
     if nodata_fa is not None:
         ws_mask &= (faccum != nodata_fa)
 
-    print(f"  Rasters loaded  |  shape={dem.shape}  |  active cells={ws_mask.sum():,}")
-    return dem, fdir, faccum, ws_mask, transform, nodata_dem
+    print(f"  Rasters loaded  |  shape={dem.shape}  |  active cells={ws_mask.sum():,}"
+          f"  |  cell_size={cell_size:.2f} m")
+    return dem, fdir, faccum, ws_mask, transform, nodata_dem, cell_size
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +104,19 @@ def compute_slope_grid(dem, fdir, ws_mask, cell_size, min_slope, nodata_dem=None
 
     Diagonal neighbours use distance = cell_size * sqrt(2).
 
-    For cells whose downstream neighbour is outside the raster extent (boundary /
-    outlet cells), the slope is estimated from the *backward* gradient — the
-    elevation drop from the nearest upstream cell to the current cell.  This
-    preserves the actual channel gradient at the outlet instead of collapsing to
-    min_slope, which would otherwise trap all watershed water in a near-flat
-    outlet cell and prevent recession.
+    Boundary handling
+    -----------------
+    Cells whose downstream neighbour is out-of-bounds *or* carries a nodata
+    value are treated as watershed-boundary cells.  Their slope is estimated
+    from the *backward* gradient (upstream cell → current cell), which is the
+    best available proxy for the local channel slope.  Two common failure modes
+    are guarded against:
+
+    1. Out-of-bounds downstream (raster edge) — handled explicitly.
+    2. In-bounds but nodata downstream — the value may be NaN or the DEM's
+       sentinel (e.g. -9999, -32768).  Python's built-in max() silently returns
+       min_slope when the first argument is NaN (max(nan, x) == x), so this
+       case must be detected *before* attempting arithmetic.
 
     Parameters
     ----------
@@ -110,8 +125,7 @@ def compute_slope_grid(dem, fdir, ws_mask, cell_size, min_slope, nodata_dem=None
     ws_mask   : 2-D bool array
     cell_size : float  [m]
     min_slope : float  [m/m]  – floor applied everywhere
-    nodata_dem: float or None – nodata sentinel in *dem*; backward cell is
-                                skipped if it carries this value.
+    nodata_dem: float or None – nodata sentinel in *dem*
 
     Returns
     -------
@@ -119,6 +133,17 @@ def compute_slope_grid(dem, fdir, ws_mask, cell_size, min_slope, nodata_dem=None
     """
     nrows, ncols = dem.shape
     slope = np.zeros_like(dem, dtype=np.float64)
+
+    # Pre-compute nodata sentinel as float64 for reliable comparison
+    _nodata = float(nodata_dem) if nodata_dem is not None else None
+
+    def _is_nodata(val):
+        """True if val is NaN or equals the DEM nodata sentinel."""
+        if np.isnan(val):
+            return True
+        if _nodata is not None and not np.isnan(_nodata) and val == _nodata:
+            return True
+        return False
 
     rows, cols = np.where(ws_mask)
 
@@ -132,23 +157,20 @@ def compute_slope_grid(dem, fdir, ws_mask, cell_size, min_slope, nodata_dem=None
         rn, cn = r + dr, c + dc
         dist   = cell_size * (2 ** 0.5 if d in D8_DIAGONAL else 1.0)
 
-        # ── Downstream neighbour is within the raster ────────────────────────
-        if 0 <= rn < nrows and 0 <= cn < ncols:
+        # ── Case 1: valid downstream cell (in-bounds, not nodata) ───────────
+        if (0 <= rn < nrows and 0 <= cn < ncols and not _is_nodata(dem[rn, cn])):
             dz = dem[r, c] - dem[rn, cn]
             slope[r, c] = max(dz / dist, min_slope)
             continue
 
-        # ── Downstream neighbour is outside the raster (boundary / outlet) ──
-        # Use the backward gradient (upstream cell → current cell) as the best
-        # available proxy for the local channel slope.  Fall back to min_slope
-        # if the upstream cell is also out of bounds or is a nodata pixel.
+        # ── Case 2: boundary cell (downstream out-of-bounds or nodata) ──────
+        # Use the backward gradient (upstream cell → this cell) as proxy for
+        # the local channel slope.
         rb, cb = r - dr, c - dc
-        if 0 <= rb < nrows and 0 <= cb < ncols:
-            upstream_val = dem[rb, cb]
-            if nodata_dem is None or upstream_val != nodata_dem:
-                dz_back = upstream_val - dem[r, c]
-                slope[r, c] = max(dz_back / dist, min_slope)
-                continue
+        if (0 <= rb < nrows and 0 <= cb < ncols and not _is_nodata(dem[rb, cb])):
+            dz_back = dem[rb, cb] - dem[r, c]
+            slope[r, c] = max(dz_back / dist, min_slope)
+            continue
 
         slope[r, c] = min_slope
 

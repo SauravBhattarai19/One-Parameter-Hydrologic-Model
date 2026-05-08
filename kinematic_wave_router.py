@@ -27,6 +27,7 @@ import pandas as pd
 
 import config
 import routing_utils as ru
+import precip_input as pi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,13 +45,13 @@ def initialise_grid(cfg):
     print("=" * 60)
 
     # --- Load rasters ---
-    dem, fdir, faccum, ws_mask, transform, nodata_dem = ru.load_rasters(cfg)
+    dem, fdir, faccum, ws_mask, transform, nodata_dem, cell_size = ru.load_rasters(cfg)
     nrows, ncols = dem.shape
 
     # --- Slope grid ---
     print("  Computing slope grid...")
     slope_2d = ru.compute_slope_grid(
-        dem, fdir, ws_mask, cfg.CELL_SIZE, cfg.MIN_SLOPE, nodata_dem
+        dem, fdir, ws_mask, cell_size, cfg.MIN_SLOPE, nodata_dem
     )
 
     # --- Topological order ---
@@ -67,14 +68,14 @@ def initialise_grid(cfg):
 
     # --- Extract 1-D arrays in topological order (fast indexing) ---
     slope_1d  = slope_2d[s_rows, s_cols]       # slope at each active cell [m/m]
-    cell_area = cfg.CELL_SIZE ** 2              # [m²]  (same for every cell)
+    cell_area = cell_size ** 2                  # [m²]  (same for every cell)
 
     # --- Index of outlet in the sorted list ---
     outlet_pos = n_cells - 1  # last element (highest accumulation = downstream-most)
 
     print("  Initialisation complete.\n")
 
-    return {
+    grid_data = {
         "dem"        : dem,
         "fdir"       : fdir,
         "ws_mask"    : ws_mask,
@@ -85,11 +86,18 @@ def initialise_grid(cfg):
         "n_cells"    : n_cells,
         "nrows"      : nrows,
         "ncols"      : ncols,
+        "cell_size"  : cell_size,
         "cell_area"  : cell_area,
         "outlet_pos" : outlet_pos,
         "outlet_rc"  : outlet_rc,
         "transform"  : transform,
     }
+
+    # Build precipitation engine (uses grid_data for spatial weight construction)
+    print("  Building precipitation engine...")
+    grid_data["precip_engine"] = pi.PrecipEngine(cfg, grid_data)
+
+    return grid_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,17 +122,21 @@ def run_time_loop(grid_data, cfg):
     dt        = cfg.TIME_STEP_SECONDS
     n_steps   = int(cfg.TOTAL_SIMULATION_TIME_HOURS * 3600.0 / dt)
     n         = cfg.MANNINGS_N
-    cell_area = grid_data["cell_area"]
-    dx        = cfg.CELL_SIZE
 
-    s_rows     = grid_data["s_rows"]
-    s_cols     = grid_data["s_cols"]
-    slope_1d   = grid_data["slope_1d"]
-    ds_idx     = grid_data["ds_idx"]
-    n_cells    = grid_data["n_cells"]
-    outlet_pos = grid_data["outlet_pos"]
-    ws_mask    = grid_data["ws_mask"]
-    grid_shape = (grid_data["nrows"], grid_data["ncols"])
+    # Output write frequency: every N steps (rounded up to at least 1)
+    _out_interval = getattr(cfg, 'OUTPUT_INTERVAL_SECONDS', None)
+    write_every   = max(1, round((_out_interval or dt) / dt))
+    cell_area = grid_data["cell_area"]
+    dx        = grid_data["cell_size"]
+
+    s_rows         = grid_data["s_rows"]
+    s_cols         = grid_data["s_cols"]
+    slope_1d       = grid_data["slope_1d"]
+    ds_idx         = grid_data["ds_idx"]
+    n_cells        = grid_data["n_cells"]
+    outlet_pos     = grid_data["outlet_pos"]
+    ws_mask        = grid_data["ws_mask"]
+    precip_engine  = grid_data["precip_engine"]
 
     # State arrays (1-D over active cells, topological order)
     volume_1d = np.zeros(n_cells, dtype=np.float64)   # [m³]  water stored per cell
@@ -158,15 +170,7 @@ def run_time_loop(grid_data, cfg):
         t_seconds = step * dt  # simulation time at the START of this step
 
         # ── 1. Rainfall array for this step ──────────────────────────────────
-        rain_2d = ru.build_rainfall_array(
-            grid_shape,
-            cfg.RAIN_INTENSITY_MM_HR,
-            cfg.RAIN_DURATION_HOURS,
-            dt,
-            t_seconds
-        )
-        # Extract rainfall rate [m/s] at each active cell (1-D, topo order)
-        rain_1d = rain_2d[s_rows, s_cols]
+        rain_1d = precip_engine.get_field_1d(t_seconds)   # [m/s], (n_cells,)
 
         # ── 2. Inflow buffer: accumulates Q_out from upstream cells ──────────
         # Reset to zero at the beginning of each step; then each cell adds
@@ -194,7 +198,11 @@ def run_time_loop(grid_data, cfg):
         # This is the standard explicit kinematic-wave approach.
 
         depth_1d = volume_1d / cell_area                         # [m]
-        depth_1d = np.clip(depth_1d, cfg.MIN_DEPTH_M, cfg.MAX_DEPTH_M)
+        # Floor only — no ceiling. A depth cap freezes Manning Q at the cap
+        # value while volume keeps growing, creating a permanent flat plateau.
+        # The flux limiter already prevents numerical runaway; deeper cells
+        # simply get larger Q_out and drain faster (physically correct).
+        depth_1d = np.maximum(depth_1d, cfg.MIN_DEPTH_M)
 
         velocity_1d = ru.mannings_velocity(depth_1d, slope_1d, n)      # [m/s]
         Q_out_1d    = ru.cell_discharge(depth_1d, velocity_1d, dx)     # [m³/s]
@@ -210,9 +218,10 @@ def run_time_loop(grid_data, cfg):
                       - Q_out_1d  * dt)
         volume_1d  = np.maximum(volume_1d, 0.0)     # no negative storage
 
-        # ── 4. Record outlet hydrograph ───────────────────────────────────────
+        # ── 4. Record outlet hydrograph (at output interval, not every step) ───
         Q_outlet = Q_out_1d[outlet_pos]
-        hydrograph.append((t_seconds + dt, Q_outlet))  # record end-of-step time
+        if (step + 1) % write_every == 0 or step == n_steps - 1:
+            hydrograph.append((t_seconds + dt, Q_outlet))
 
         # Progress reporting every 10 % of simulation
         if (step + 1) % max(1, n_steps // 10) == 0:

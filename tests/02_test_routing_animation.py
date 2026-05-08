@@ -1,16 +1,21 @@
 """
 tests/02_test_routing_animation.py
 ===================================
-Visualises the kinematic-wave routing model spatially AND temporally by:
+Visualises the kinematic-wave routing model spatially AND temporally.
 
-  LEFT  panel – 2-D map of water depth [m] over the watershed at each frame
-                (draped on a shaded DEM background)
-  RIGHT panel – Hydrograph (Q at outlet) building up in real time,
-                with a red vertical cursor showing the current time step
+Layout (uniform mode)
+---------------------
+  LEFT  – 2-D water depth map over the watershed
+  RIGHT – Outlet hydrograph building up in real time
 
-The script imports directly from the parent-directory modules
-(kinematic_wave_router, routing_utils, config) so it re-runs the
-simulation itself rather than reading a pre-existing CSV.
+Layout (thiessen / idw mode)  ← extra panel unlocked
+-----------------------------------------------------
+  LEFT        – 2-D water depth map + gauge location markers (▲)
+                 Marker SIZE scales with current rain intensity at that gauge.
+  TOP-RIGHT   – Outlet hydrograph
+  BOTTOM-RIGHT– Gauge precipitation timeseries (one line / gauge)
+                 Vertical cursor stays in sync with the hydrograph cursor.
+                 Current mm/hr value per gauge annotated next to the cursor.
 
 Output:  output/routing_animation.gif
 """
@@ -20,11 +25,12 @@ import sys
 import time
 
 import numpy as np
+import pandas as pd
 import matplotlib
-matplotlib.use("Agg")          # no display needed – we write to file
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-import matplotlib.colors as mcolors
+from matplotlib.gridspec import GridSpec
 from matplotlib.colors import LightSource
 import rasterio
 
@@ -33,18 +39,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import config
 import routing_utils as ru
+import precip_input as pi
 from kinematic_wave_router import initialise_grid
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SETTINGS  (tweak without touching the main model)
+# SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
-FRAME_EVERY_N_STEPS = 10        # capture a frame every N time steps
-GIF_FPS             = 8         # frames per second in the output GIF
-GIF_DPI             = 110       # resolution of each frame
+_out_interval       = getattr(config, 'OUTPUT_INTERVAL_SECONDS', None)
+FRAME_EVERY_N_STEPS = max(1, round((_out_interval or config.TIME_STEP_SECONDS * 10)
+                                   / config.TIME_STEP_SECONDS))
+GIF_FPS             = 8
+GIF_DPI             = 110
 OUTPUT_GIF          = os.path.join(config.OUTPUT_DIR, "routing_animation.gif")
+BG                  = "#0f1117"   # dark background colour
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  Initialise grid (load rasters, build topo order, slopes, etc.)
+# 1.  Initialise grid (loads rasters, builds topo order + PrecipEngine)
 # ─────────────────────────────────────────────────────────────────────────────
 print("Initialising routing grid …")
 grid_data = initialise_grid(config)
@@ -59,18 +69,35 @@ cell_area  = grid_data["cell_area"]
 nrows      = grid_data["nrows"]
 ncols      = grid_data["ncols"]
 ws_mask    = grid_data["ws_mask"]
-dem        = grid_data["dem"]
 
-dx = config.CELL_SIZE
-dt = config.TIME_STEP_SECONDS
-n  = config.MANNINGS_N
-grid_shape = (nrows, ncols)
-n_steps    = int(config.TOTAL_SIMULATION_TIME_HOURS * 3600.0 / dt)
+dx             = grid_data["cell_size"]
+dt             = config.TIME_STEP_SECONDS
+n_mann         = config.MANNINGS_N
+precip_engine  = grid_data["precip_engine"]
+n_steps        = int(config.TOTAL_SIMULATION_TIME_HOURS * 3600.0 / dt)
 
-print(f"Total steps : {n_steps:,}  |  frames to capture : {n_steps // FRAME_EVERY_N_STEPS}")
+_precip_method = getattr(config, 'PRECIP_METHOD', 'uniform').lower()
+_gauge_mode    = (_precip_method in ('thiessen', 'idw'))
+
+print(f"Total steps : {n_steps:,}  |  frames : {n_steps // FRAME_EVERY_N_STEPS}"
+      f"  |  precip method : {_precip_method}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Load DEM for shaded-relief background
+# 2.  Load gauge metadata (gauge mode only)
+# ─────────────────────────────────────────────────────────────────────────────
+if _gauge_mode:
+    gauges_df   = pd.read_csv(config.PRECIP_GAUGE_FILE).set_index('gauge_id')
+    gauge_ids   = gauges_df.index.tolist()
+    gauge_names = gauges_df['name'].tolist()
+    gauge_xs    = gauges_df['easting_m'].values.astype(float)
+    gauge_ys    = gauges_df['northing_m'].values.astype(float)
+    n_gauges    = len(gauge_ids)
+    # One distinct colour per gauge
+    GAUGE_COLORS = [plt.get_cmap('tab10')(i) for i in range(n_gauges)]
+    print(f"  Gauges loaded   |  {n_gauges} gauges: {gauge_names}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Load DEM → hillshade + geographic extent
 # ─────────────────────────────────────────────────────────────────────────────
 with rasterio.open(config.ROUTING_DEM_PATH) as src:
     dem_bg     = src.read(1).astype(float)
@@ -79,79 +106,108 @@ with rasterio.open(config.ROUTING_DEM_PATH) as src:
 
 if nodata_dem is not None:
     dem_bg[dem_bg == nodata_dem] = np.nan
+dem_bg[~np.isfinite(dem_bg)] = np.nan
 
-# Shaded relief (hillshade) – static background
 ls        = LightSource(azdeg=315, altdeg=45)
 dem_valid = np.where(np.isnan(dem_bg), 0, dem_bg)
-hillshade = ls.hillshade(dem_valid, vert_exag=2, dx=dx, dy=dx)   # [0,1]
+hillshade = ls.hillshade(dem_valid, vert_exag=2, dx=dx, dy=dx)
+
+# imshow extent = [left, right, bottom, top] in projected metres
+left   = transform.c
+right  = transform.c + ncols * transform.a
+top    = transform.f
+bottom = transform.f + nrows * transform.e   # transform.e < 0
+map_extent = [left, right, bottom, top]
+
+# Watershed bounding box for axis zoom
+ws_rows_idx, ws_cols_idx = np.where(ws_mask)
+pad_cells = max(5, int(max(ws_rows_idx.max() - ws_rows_idx.min(),
+                           ws_cols_idx.max() - ws_cols_idx.min()) * 0.02))
+ws_x_min = left + (ws_cols_idx.min() - pad_cells) * transform.a
+ws_x_max = left + (ws_cols_idx.max() + 1 + pad_cells) * transform.a
+ws_y_min = top  + (ws_rows_idx.max() + 1 + pad_cells) * transform.e
+ws_y_max = top  + (ws_rows_idx.min() - pad_cells)     * transform.e
+
+outlet_x = left + (grid_data["outlet_rc"][1] + 0.5) * transform.a
+outlet_y = top  + (grid_data["outlet_rc"][0] + 0.5) * transform.e
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Run the time loop, capturing frames
+# 4.  Run the time loop, capturing frames
 # ─────────────────────────────────────────────────────────────────────────────
 print("Running simulation and capturing frames …")
 
-volume_1d   = np.zeros(n_cells, dtype=np.float64)
-Q_out_1d    = np.zeros(n_cells, dtype=np.float64)
+volume_1d  = np.zeros(n_cells, dtype=np.float64)
+Q_out_1d   = np.zeros(n_cells, dtype=np.float64)
 
-# Storage for animation
-frame_times_hr  = []   # simulation time [hours] for each captured frame
-frame_depths    = []   # 2-D depth arrays, one per frame
-hydro_times_hr  = []   # full hydrograph time axis
-hydro_Q         = []   # full hydrograph Q values
+frame_times_hr = []
+frame_depths   = []
+hydro_times_hr = []
+hydro_Q        = []
 
 t_wall = time.time()
 
 for step in range(n_steps):
     t_seconds = step * dt
 
-    # ── Rainfall ────────────────────────────────────────────────────────────
-    rain_2d = ru.build_rainfall_array(
-        grid_shape, config.RAIN_INTENSITY_MM_HR,
-        config.RAIN_DURATION_HOURS, dt, t_seconds
-    )
-    rain_1d = rain_2d[s_rows, s_cols]
+    rain_1d   = precip_engine.get_field_1d(t_seconds)
 
-    # ── Inflow from upstream cells (previous step Q_out) ────────────────────
     inflow_1d = np.zeros(n_cells, dtype=np.float64)
     valid_ds  = ds_idx >= 0
     np.add.at(inflow_1d, ds_idx[valid_ds], Q_out_1d[valid_ds])
 
-    # ── Manning's physics ────────────────────────────────────────────────────
-    depth_1d    = np.clip(volume_1d / cell_area, config.MIN_DEPTH_M, config.MAX_DEPTH_M)
-    velocity_1d = ru.mannings_velocity(depth_1d, slope_1d, n)
+    depth_1d    = np.maximum(volume_1d / cell_area, config.MIN_DEPTH_M)
+    velocity_1d = ru.mannings_velocity(depth_1d, slope_1d, n_mann)
     Q_out_1d    = ru.cell_discharge(depth_1d, velocity_1d, dx)
     Q_out_1d    = ru.flux_limiter(Q_out_1d, volume_1d, dt)
 
-    # ── Volume advance ───────────────────────────────────────────────────────
     volume_1d = np.maximum(
         volume_1d + rain_1d * cell_area * dt + inflow_1d * dt - Q_out_1d * dt,
         0.0
     )
 
-    # ── Record hydrograph ────────────────────────────────────────────────────
     t_end_hr = (t_seconds + dt) / 3600.0
     hydro_times_hr.append(t_end_hr)
     hydro_Q.append(Q_out_1d[outlet_pos])
 
-    # ── Capture frame ────────────────────────────────────────────────────────
     if step % FRAME_EVERY_N_STEPS == 0 or step == n_steps - 1:
-        # Map 1-D depths back to 2-D spatial grid
-        depth_2d            = np.full((nrows, ncols), np.nan)
+        depth_2d               = np.full((nrows, ncols), np.nan)
         depth_2d[s_rows, s_cols] = volume_1d / cell_area
-        depth_2d[~ws_mask]  = np.nan   # mask outside watershed
-
+        depth_2d[~ws_mask]     = np.nan
         frame_depths.append(depth_2d.copy())
         frame_times_hr.append(t_end_hr)
 
         if (step // FRAME_EVERY_N_STEPS) % 10 == 0:
-            print(f"  Frame {len(frame_depths):3d}  |  t={t_end_hr:.2f}h  "
-                  f"|  Q={hydro_Q[-1]:.3f} m³/s  "
-                  f"|  wall={time.time()-t_wall:.1f}s")
+            print(f"  Frame {len(frame_depths):3d}  |  t={t_end_hr:.2f}h"
+                  f"  |  Q={hydro_Q[-1]:.3f} m³/s"
+                  f"  |  wall={time.time()-t_wall:.1f}s")
 
 print(f"Captured {len(frame_depths)} frames in {time.time()-t_wall:.1f}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  Build animation
+# 5.  Pre-compute gauge precipitation at every frame time (gauge mode)
+# ─────────────────────────────────────────────────────────────────────────────
+# gauge_mmhr_at_frames  shape (n_frames, n_gauges)  units mm/hr
+# dense_gauge_mmhr      shape (T_knots, n_gauges)   for static line drawing
+if _gauge_mode:
+    n_fr = len(frame_times_hr)
+    gauge_mmhr_at_frames = np.zeros((n_fr, n_gauges), dtype=np.float64)
+    for fi, t_hr in enumerate(frame_times_hr):
+        r = precip_engine._interp_gauges(t_hr * 3600.0)   # m/s per gauge
+        gauge_mmhr_at_frames[fi] = r * 1000.0 * 3600.0    # → mm/hr
+
+    # Static lines use the engine's internal time knots (linear interpolation
+    # between CSV rows, so knots are the exact breakpoints — no denser sampling needed)
+    dense_t_s  = precip_engine._time_s                     # (T,)
+    dense_t_hr = dense_t_s / 3600.0
+    dense_gauge_mmhr = np.zeros((len(dense_t_s), n_gauges), dtype=np.float64)
+    for ti, ts in enumerate(dense_t_s):
+        r = precip_engine._interp_gauges(ts)
+        dense_gauge_mmhr[ti] = r * 1000.0 * 3600.0
+
+    max_rain_mmhr = max(float(dense_gauge_mmhr.max()), 0.1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Build figure
 # ─────────────────────────────────────────────────────────────────────────────
 print("Rendering animation …")
 
@@ -159,61 +215,95 @@ hydro_times_hr = np.array(hydro_times_hr)
 hydro_Q        = np.array(hydro_Q)
 n_frames       = len(frame_depths)
 
-# Colour scale: fix to the 99th-percentile depth across all frames
 max_depth_vis = max(
     np.nanpercentile(d, 99) for d in frame_depths if np.any(~np.isnan(d))
 )
-max_depth_vis = max(max_depth_vis, 1e-4)   # safety floor
-
-# Peak Q for y-axis
-peak_Q = max(hydro_Q.max(), 1e-3)
+max_depth_vis = max(max_depth_vis, 1e-4)
+peak_Q        = max(hydro_Q.max(), 1e-3)
 
 # ── Figure layout ─────────────────────────────────────────────────────────
-fig, (ax_map, ax_hyd) = plt.subplots(
-    1, 2,
-    figsize=(14, 6),
-    gridspec_kw={"width_ratios": [1.2, 1]}
-)
-fig.patch.set_facecolor("#0f1117")
-for ax in (ax_map, ax_hyd):
-    ax.set_facecolor("#0f1117")
+if _gauge_mode:
+    # 2 columns: map spans full height | stacked hydro + precip panel
+    fig = plt.figure(figsize=(19, 9), facecolor=BG)
+    gs  = GridSpec(2, 2, figure=fig,
+                   width_ratios=[1.3, 1], height_ratios=[1, 1],
+                   hspace=0.40, wspace=0.32)
+    ax_map  = fig.add_subplot(gs[:, 0])
+    ax_hyd  = fig.add_subplot(gs[0, 1])
+    ax_prec = fig.add_subplot(gs[1, 1])
+    all_axes = [ax_map, ax_hyd, ax_prec]
+else:
+    fig, (ax_map, ax_hyd) = plt.subplots(
+        1, 2, figsize=(14, 6), facecolor=BG,
+        gridspec_kw={"width_ratios": [1.2, 1]}
+    )
+    ax_prec  = None
+    all_axes = [ax_map, ax_hyd]
+
+fig.patch.set_facecolor(BG)
+for ax in all_axes:
+    ax.set_facecolor(BG)
     ax.tick_params(colors="white", labelsize=8)
     for spine in ax.spines.values():
         spine.set_edgecolor("#444")
 
-# ── LEFT: spatial map ─────────────────────────────────────────────────────
-# Hillshade background (static)
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  Spatial map panel
+# ─────────────────────────────────────────────────────────────────────────────
 ax_map.imshow(
-    hillshade,
-    cmap="gray", vmin=0, vmax=1,
-    aspect="auto", alpha=0.55,
-    extent=[0, ncols, nrows, 0]
+    hillshade, cmap="gray", vmin=0, vmax=1,
+    aspect="equal", alpha=0.55,
+    extent=map_extent, origin="upper",
 )
-
-# Watershed outline
-ws_outline = np.where(ws_mask, 0.5, np.nan)
-ax_map.imshow(ws_outline, cmap="Greys", vmin=0, vmax=1,
-              aspect="auto", alpha=0.15, extent=[0, ncols, nrows, 0])
-
-# Water depth layer (updated each frame)
+ax_map.imshow(
+    np.where(ws_mask, 0.5, np.nan), cmap="Greys", vmin=0, vmax=1,
+    aspect="equal", alpha=0.15,
+    extent=map_extent, origin="upper",
+)
 depth_im = ax_map.imshow(
-    frame_depths[0],
-    cmap="YlGnBu",
+    frame_depths[0], cmap="YlGnBu",
     vmin=0, vmax=max_depth_vis,
-    aspect="auto",
-    alpha=0.85,
-    extent=[0, ncols, nrows, 0]
+    aspect="equal", alpha=0.85,
+    extent=map_extent, origin="upper",
 )
+ax_map.set_xlim(ws_x_min, ws_x_max)
+ax_map.set_ylim(ws_y_min, ws_y_max)
 
-# Outlet marker
-ax_map.plot(
-    grid_data["outlet_rc"][1],
-    grid_data["outlet_rc"][0],
-    marker="*", color="#FF4444", markersize=12,
-    zorder=10, label="Outlet"
-)
+# Outlet star
+ax_map.plot(outlet_x, outlet_y, marker="*", color="#FF4444",
+            markersize=12, zorder=10, label="Outlet", linestyle="None")
+
+# ── Gauge markers (gauge mode) ─────────────────────────────────────────────
+# Default stubs (overwritten below if gauge mode)
+gauge_scat_dyn = None
+
+if _gauge_mode:
+    # Static triangle pin + name label for each gauge
+    for gi in range(n_gauges):
+        ax_map.plot(gauge_xs[gi], gauge_ys[gi],
+                    marker="^", color=GAUGE_COLORS[gi],
+                    markersize=9, zorder=12, linestyle="None",
+                    label=gauge_names[gi])
+        ax_map.annotate(
+            gauge_names[gi],
+            xy=(gauge_xs[gi], gauge_ys[gi]),
+            xytext=(6, 5), textcoords="offset points",
+            color=GAUGE_COLORS[gi], fontsize=7, fontweight="bold",
+            zorder=13,
+        )
+    # Dynamic scatter: circle size ∝ current rain intensity
+    # (grows during rain, shrinks to minimum during dry period)
+    init_sizes = (gauge_mmhr_at_frames[0] / max_rain_mmhr) * 600 + 40
+    gauge_scat_dyn = ax_map.scatter(
+        gauge_xs, gauge_ys,
+        s=init_sizes,
+        c=[list(c) for c in GAUGE_COLORS],
+        alpha=0.55, zorder=11,
+        linewidths=1.5, edgecolors="white",
+    )
+
 ax_map.legend(loc="lower right", facecolor="#1a1a2e", labelcolor="white",
-              fontsize=8, framealpha=0.7)
+              fontsize=7.5, framealpha=0.75)
 
 cbar = fig.colorbar(depth_im, ax=ax_map, fraction=0.035, pad=0.02)
 cbar.set_label("Water Depth  [m]", color="white", fontsize=9)
@@ -221,20 +311,24 @@ cbar.ax.yaxis.set_tick_params(color="white")
 plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
 
 ax_map.set_title("Watershed Water Depth", color="white", fontsize=11, pad=6)
-ax_map.set_xlabel("Column (cells)", color="#aaa", fontsize=8)
-ax_map.set_ylabel("Row (cells)", color="#aaa", fontsize=8)
+ax_map.set_xlabel("Easting  [m]",  color="#aaa", fontsize=8)
+ax_map.set_ylabel("Northing  [m]", color="#aaa", fontsize=8)
+ax_map.ticklabel_format(style="sci", axis="both", scilimits=(3, 3))
+
 time_text = ax_map.text(
     0.03, 0.97, "", transform=ax_map.transAxes,
     color="white", fontsize=10, va="top",
-    bbox=dict(boxstyle="round,pad=0.3", fc="#1a1a2e", alpha=0.8)
+    bbox=dict(boxstyle="round,pad=0.3", fc="#1a1a2e", alpha=0.8),
 )
 rain_text = ax_map.text(
     0.03, 0.88, "", transform=ax_map.transAxes,
     color="#FFD700", fontsize=9, va="top",
-    bbox=dict(boxstyle="round,pad=0.3", fc="#1a1a2e", alpha=0.8)
+    bbox=dict(boxstyle="round,pad=0.3", fc="#1a1a2e", alpha=0.8),
 )
 
-# ── RIGHT: hydrograph ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  Hydrograph panel
+# ─────────────────────────────────────────────────────────────────────────────
 ax_hyd.set_xlim(0, config.TOTAL_SIMULATION_TIME_HOURS)
 ax_hyd.set_ylim(0, peak_Q * 1.15)
 ax_hyd.set_xlabel("Time  [hours]", color="#aaa", fontsize=9)
@@ -242,76 +336,134 @@ ax_hyd.set_ylabel("Q at Outlet  [m³/s]", color="#aaa", fontsize=9)
 ax_hyd.set_title("Outlet Hydrograph", color="white", fontsize=11, pad=6)
 ax_hyd.grid(True, color="#333", linewidth=0.5, linestyle="--")
 
-# Rainfall duration shading
-rain_end_hr = config.RAIN_DURATION_HOURS
-ax_hyd.axvspan(0, rain_end_hr, alpha=0.12, color="#4fc3f7",
-               label=f"Rainfall ({config.RAIN_INTENSITY_MM_HR} mm/hr)")
+if _precip_method == 'uniform':
+    rain_end_hr = config.RAIN_DURATION_HOURS
+    rain_label  = f"Rainfall ({config.RAIN_INTENSITY_MM_HR} mm/hr, uniform)"
+else:
+    rain_end_hr = precip_engine.rain_end_seconds / 3600.0
+    rain_label  = f"Rainfall period ({_precip_method})"
+ax_hyd.axvspan(0, rain_end_hr, alpha=0.12, color="#4fc3f7", label=rain_label)
 ax_hyd.legend(loc="upper right", facecolor="#1a1a2e", labelcolor="white",
               fontsize=8, framealpha=0.7)
 
-# Growing hydrograph line
-hyd_line, = ax_hyd.plot([], [], color="#00e5ff", linewidth=1.8, zorder=4)
-
-# Peak annotation (will be updated)
-peak_annot = ax_hyd.annotate(
+hyd_line,  = ax_hyd.plot([], [], color="#00e5ff", linewidth=1.8, zorder=4)
+peak_annot  = ax_hyd.annotate(
     "", xy=(0, 0), xytext=(0, 0),
     color="#FF4444", fontsize=8,
-    arrowprops=dict(arrowstyle="->", color="#FF4444")
+    arrowprops=dict(arrowstyle="->", color="#FF4444"),
 )
-
-# Vertical time cursor
 vline = ax_hyd.axvline(0, color="#FF4444", linewidth=1.2, linestyle="--", zorder=5)
 
-plt.tight_layout(pad=1.5)
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  Gauge precipitation panel (gauge mode only)
+# ─────────────────────────────────────────────────────────────────────────────
+vline_prec     = None
+gauge_val_texts = []
+
+if _gauge_mode:
+    ax_prec.set_facecolor(BG)
+    ax_prec.set_xlim(0, config.TOTAL_SIMULATION_TIME_HOURS)
+    ax_prec.set_ylim(0, max_rain_mmhr * 1.25)
+    ax_prec.set_xlabel("Time  [hours]", color="#aaa", fontsize=9)
+    ax_prec.set_ylabel("Intensity  [mm/hr]", color="#aaa", fontsize=9)
+    ax_prec.set_title(
+        f"Gauge Precipitation  ({_precip_method.title()} weighting)",
+        color="white", fontsize=11, pad=6,
+    )
+    ax_prec.grid(True, color="#333", linewidth=0.5, linestyle="--")
+
+    # Static full timeseries line per gauge
+    for gi in range(n_gauges):
+        ax_prec.plot(
+            dense_t_hr, dense_gauge_mmhr[:, gi],
+            color=GAUGE_COLORS[gi], linewidth=1.8,
+            label=gauge_names[gi], zorder=4,
+        )
+    ax_prec.legend(loc="upper right", facecolor="#1a1a2e", labelcolor="white",
+                   fontsize=8, framealpha=0.7)
+
+    # Vertical time cursor (shared with hydrograph)
+    vline_prec = ax_prec.axvline(
+        0, color="#FF4444", linewidth=1.2, linestyle="--", zorder=6,
+    )
+
+    # Current-value labels: one per gauge, placed just right of the cursor.
+    # Initialised off-screen; update() positions them each frame.
+    for gi in range(n_gauges):
+        txt = ax_prec.text(
+            0, 0, "",
+            color=GAUGE_COLORS[gi], fontsize=8,
+            va="center", ha="left", zorder=7,
+            fontweight="bold",
+        )
+        gauge_val_texts.append(txt)
+
+if not _gauge_mode:
+    plt.tight_layout(pad=1.5)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Animation update function
+# 10. Animation update function
 # ─────────────────────────────────────────────────────────────────────────────
 def update(frame_idx):
-    t_hr       = frame_times_hr[frame_idx]
-    depth_2d   = frame_depths[frame_idx]
+    t_hr     = frame_times_hr[frame_idx]
+    depth_2d = frame_depths[frame_idx]
 
-    # --- spatial map ---
-    depth_2d_clipped = np.where(np.isnan(depth_2d), np.nan,
-                                np.clip(depth_2d, 0, max_depth_vis))
-    depth_im.set_data(depth_2d_clipped)
+    # ── Spatial map ───────────────────────────────────────────────────────────
+    depth_im.set_data(np.where(np.isnan(depth_2d), np.nan,
+                               np.clip(depth_2d, 0, max_depth_vis)))
     time_text.set_text(f"t = {t_hr:.2f} h")
+    is_raining = precip_engine.is_raining(t_hr * 3600.0)
+    rain_text.set_text("☂  Raining" if is_raining else "☀  Dry period")
 
-    is_raining = t_hr <= config.RAIN_DURATION_HOURS
-    rain_text.set_text("☂ Raining" if is_raining else "☀ Dry period")
-
-    # --- hydrograph (show data up to current frame time) ---
+    # ── Hydrograph ────────────────────────────────────────────────────────────
     mask = hydro_times_hr <= t_hr
     hyd_line.set_data(hydro_times_hr[mask], hydro_Q[mask])
-
-    # Move cursor
     vline.set_xdata([t_hr, t_hr])
-
-    # Annotate running peak
     if mask.any():
-        local_peak_idx = np.argmax(hydro_Q[mask])
-        local_peak_Q   = hydro_Q[mask][local_peak_idx]
-        local_peak_t   = hydro_times_hr[mask][local_peak_idx]
-        if local_peak_Q > 0.01:
-            peak_annot.xy          = (local_peak_t, local_peak_Q)
-            peak_annot.xytext      = (local_peak_t + 0.1,
-                                      local_peak_Q * 0.85)
-            peak_annot.set_text(f"Peak\n{local_peak_Q:.2f} m³/s")
+        lpi = np.argmax(hydro_Q[mask])
+        lpQ = hydro_Q[mask][lpi]
+        lpt = hydro_times_hr[mask][lpi]
+        if lpQ > 0.01:
+            peak_annot.xy     = (lpt, lpQ)
+            peak_annot.xytext = (lpt + 0.1, lpQ * 0.85)
+            peak_annot.set_text(f"Peak\n{lpQ:.2f} m³/s")
         else:
             peak_annot.set_text("")
 
-    return depth_im, hyd_line, vline, time_text, rain_text, peak_annot
+    artists = [depth_im, hyd_line, vline, time_text, rain_text, peak_annot]
+
+    # ── Gauge extras (gauge mode only) ────────────────────────────────────────
+    if _gauge_mode:
+        cur_mmhr = gauge_mmhr_at_frames[frame_idx]   # (n_gauges,)
+
+        # 1. Move precip cursor
+        vline_prec.set_xdata([t_hr, t_hr])
+        artists.append(vline_prec)
+
+        # 2. Resize gauge bubble on map: size ∝ current intensity
+        sizes = (cur_mmhr / max_rain_mmhr) * 600 + 40
+        gauge_scat_dyn.set_sizes(sizes)
+        artists.append(gauge_scat_dyn)
+
+        # 3. Floating value labels on precip panel (right of cursor)
+        label_x = t_hr + config.TOTAL_SIMULATION_TIME_HOURS * 0.015
+        for gi, (txt, val) in enumerate(zip(gauge_val_texts, cur_mmhr)):
+            txt.set_position((label_x, val))
+            txt.set_text(f"{val:.1f}")
+            artists.append(txt)
+
+    return artists
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  Render and save GIF
+# 11. Render and save GIF
 # ─────────────────────────────────────────────────────────────────────────────
 anim = animation.FuncAnimation(
     fig,
     update,
     frames=n_frames,
     interval=1000 // GIF_FPS,
-    blit=True
+    blit=True,
 )
 
 writer = animation.PillowWriter(fps=GIF_FPS)
@@ -319,5 +471,5 @@ anim.save(OUTPUT_GIF, writer=writer, dpi=GIF_DPI,
           savefig_kwargs={"facecolor": fig.get_facecolor()})
 
 plt.close(fig)
-print(f"\n✓  Animation saved → {OUTPUT_GIF}")
+print(f"\n  Animation saved → {OUTPUT_GIF}")
 print(f"   Frames : {n_frames}   FPS : {GIF_FPS}   DPI : {GIF_DPI}")
