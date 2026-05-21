@@ -28,6 +28,7 @@ import pandas as pd
 import config
 import routing_utils as ru
 import precip_input as pi
+import runoff_input as ri
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +69,7 @@ def initialise_grid(cfg):
 
     # --- Extract 1-D arrays in topological order (fast indexing) ---
     slope_1d  = slope_2d[s_rows, s_cols]       # slope at each active cell [m/m]
+    faccum_1d = faccum[s_rows, s_cols]         # flow accumulation [cell count] for VSA/OPM
     cell_area = cell_size ** 2                  # [m²]  (same for every cell)
 
     # --- Index of outlet in the sorted list ---
@@ -82,6 +84,7 @@ def initialise_grid(cfg):
         "s_rows"     : s_rows,        # 1-D topologically sorted row indices
         "s_cols"     : s_cols,        # 1-D topologically sorted col indices
         "slope_1d"   : slope_1d,      # [m/m]
+        "faccum_1d"  : faccum_1d,     # [cell count] flow accumulation in topo order
         "ds_idx"     : ds_idx,        # downstream position index (-1 = outlet/off-mask)
         "n_cells"    : n_cells,
         "nrows"      : nrows,
@@ -96,6 +99,14 @@ def initialise_grid(cfg):
     # Build precipitation engine (uses grid_data for spatial weight construction)
     print("  Building precipitation engine...")
     grid_data["precip_engine"] = pi.PrecipEngine(cfg, grid_data)
+
+    # Build runoff generation engine (optional; None when RUNOFF_SOURCE='none')
+    _rsrc = getattr(cfg, 'RUNOFF_SOURCE', 'none').lower()
+    if _rsrc != 'none':
+        print("  Building runoff generation engine...")
+        grid_data["runoff_engine"] = ri.RunoffEngine(cfg, grid_data)
+    else:
+        grid_data["runoff_engine"] = None
 
     return grid_data
 
@@ -137,6 +148,7 @@ def run_time_loop(grid_data, cfg):
     outlet_pos     = grid_data["outlet_pos"]
     ws_mask        = grid_data["ws_mask"]
     precip_engine  = grid_data["precip_engine"]
+    runoff_engine  = grid_data.get("runoff_engine")   # None when RUNOFF_SOURCE='none'
 
     # State arrays (1-D over active cells, topological order)
     volume_1d = np.zeros(n_cells, dtype=np.float64)   # [m³]  water stored per cell
@@ -211,7 +223,16 @@ def run_time_loop(grid_data, cfg):
         Q_out_1d    = ru.flux_limiter(Q_out_1d, volume_1d, dt)         # [m³/s]
 
         # Volume advance
-        rain_vol   = rain_1d * cell_area * dt        # [m³] rainfall added
+        # If a RunoffEngine is active, convert rainfall to effective runoff first
+        # (forward Euler: query current VSA/mask, then advance sandbox state).
+        # With RUNOFF_SOURCE='none', source_1d == rain_1d (bit-identical to old code).
+        if runoff_engine is not None:
+            source_1d = runoff_engine.get_effective_1d(t_seconds, rain_1d)  # [m/s]
+            runoff_engine.update_state(rain_1d, dt)
+        else:
+            source_1d = rain_1d
+
+        rain_vol   = source_1d * cell_area * dt      # [m³] effective runoff added
         volume_1d  = (volume_1d
                       + rain_vol
                       + inflow_1d * dt

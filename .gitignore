@@ -1,5 +1,7 @@
 # Output folder
 output/
+presentation/
+tools/
 
 # Python
 __pycache__/
@@ -37,6 +39,7 @@ env/
 *.swp
 *.swo
 .claude/
+
 
 # OS
 .DS_Store

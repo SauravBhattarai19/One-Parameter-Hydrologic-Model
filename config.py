@@ -67,6 +67,37 @@ PRECIP_GAUGE_FILE      = "precipitation/gauges.csv"
 PRECIP_TIMESERIES_FILE = "precipitation/timeseries.csv"
 PRECIP_IDW_POWER       = 2.0        # IDW distance exponent (p=2 is standard)
 
+# ── Runoff generation engine ─────────────────────────────────────────────────
+# Controls whether a runoff-generation model transforms rainfall into effective
+# runoff before it enters the kinematic-wave router.
+#   'none'        → all rainfall is direct runoff (default, backward compatible)
+#   'coefficient' → multiply by static spatial Cf raster (0–1)
+#   'raster'      → pre-computed runoff raster time series
+#   'scs_cn'      → SCS Curve Number: per-cell CN raster + cumulative rainfall
+#   'vsa_opm'     → Variable Source Area: Pradhan & Ogden (2010) OPM
+RUNOFF_SOURCE           = 'vsa_opm'
+RUNOFF_COEFFICIENT_PATH = "runoff/runoff_coefficient.tif"
+RUNOFF_RASTER_MANIFEST  = "runoff/manifest.csv"
+RUNOFF_CN_PATH          = "runoff/curve_number.tif"
+RUNOFF_SCS_Ia_FACTOR    = 0.2       # SCS initial abstraction ratio (standard 0.2)
+
+# ── OPM / VSA parameters (used when RUNOFF_SOURCE = 'vsa_opm') ──────────────
+# OPM_SD_MAX_INITIAL: initial unsaturated-zone storage capacity at the
+#   catchment divide [m].  Represents max soil moisture deficit from field
+#   capacity.  Typical range: 0.05–0.10 m (shallow soils) to 0.20–0.30 m
+#   (deep forest soils).
+OPM_SD_MAX_INITIAL = 0.10    # m
+
+# OPM_Q_MAX: observed baseflow / initial discharge at the outlet [m³/s].
+#   Used in Eq 10 (Pradhan & Ogden 2010) to calibrate the initial threshold
+#   area A_t.  Must be > 0.001 m³/s (the model's Q_min constant).
+OPM_Q_MAX          = 0.50    # m³/s  — set to observed pre-storm discharge
+
+# OPM_PHI: drainable porosity (specific yield) of the soil [-].
+#   Relates volume change of groundwater to saturated-zone thickness change.
+#   Typical values: sandy soils 0.25–0.35; loamy soils 0.15–0.25; clay 0.05–0.15.
+OPM_PHI            = 0.35    # dimensionless
+
 # --- Numerical stability / physical limits ---
 # Minimum slope used in Manning's equation to avoid division-by-zero.
 # At 1e-5, a single flat cell (dx≈94 m) takes ~30 min to drain 1 m of water;
