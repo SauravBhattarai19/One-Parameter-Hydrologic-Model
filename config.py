@@ -43,7 +43,7 @@ MANNINGS_N = 0.09
 TIME_STEP_SECONDS = 5           # seconds
 
 # Total length of the simulation
-TOTAL_SIMULATION_TIME_HOURS = 15   # hours
+TOTAL_SIMULATION_TIME_HOURS = 144  # hours  (FLOOD_03: 2024-09-26 to 2024-10-01)
 
 # --- Output write interval ---
 # How often to record a row in hydrograph.csv (seconds of simulation time).
@@ -63,8 +63,8 @@ RAIN_DURATION_HOURS  = 3.0          # hours  (rainfall stops after this; remaind
 #          'idw'      → Inverse Distance Weighting (exponent = PRECIP_IDW_POWER)
 # When using 'thiessen' or 'idw' the rainfall comes from the CSV files below.
 PRECIP_METHOD          = 'thiessen'
-PRECIP_GAUGE_FILE      = "precipitation/gauges.csv"
-PRECIP_TIMESERIES_FILE = "precipitation/timeseries.csv"
+PRECIP_GAUGE_FILE      = "test_data/opm_format/FLOOD_03/gauges.csv"
+PRECIP_TIMESERIES_FILE = "test_data/opm_format/FLOOD_03/timeseries.csv"
 PRECIP_IDW_POWER       = 2.0        # IDW distance exponent (p=2 is standard)
 
 # ── Runoff generation engine ─────────────────────────────────────────────────
@@ -98,6 +98,12 @@ OPM_Q_MAX          = 0.50    # m³/s  — set to observed pre-storm discharge
 #   Typical values: sandy soils 0.25–0.35; loamy soils 0.15–0.25; clay 0.05–0.15.
 OPM_PHI            = 0.35    # dimensionless
 
+# OPM_K_SAT: saturated hydraulic conductivity of the soil [m/day].
+#   Used in Darcy lateral drainage at the catchment divide (sandbox water
+#   balance, Eq 12).  Assumed uniform over the catchment.
+#   Typical values: clay 0.01–0.1; loam 0.1–1; sandy loam 1–10; sand 10–100.
+OPM_K_SAT          = 44.0   # m/day  (≈ sandy loam / gravelly soil)
+
 # --- Numerical stability / physical limits ---
 # Minimum slope used in Manning's equation to avoid division-by-zero.
 # At 1e-5, a single flat cell (dx≈94 m) takes ~30 min to drain 1 m of water;
@@ -119,4 +125,17 @@ MAX_DEPTH_M     = 10.0             # metres  (display use only)
 
 # --- Output ---
 HYDROGRAPH_CSV  = "output/hydrograph.csv"  # Time-series Q at the outlet
+
+# ── Backend selection ─────────────────────────────────────────────────────────
+# 'cpu' → NumPy only (default; always works, no extra dependencies)
+# 'gpu' → CuPy/CUDA acceleration (falls back to CPU with a warning if CuPy is
+#          not installed or no CUDA GPU is found)
+BACKEND = 'cpu'
+
+# Floating-point precision for GPU state arrays.
+#   'float64' → full double precision; results match CPU bit-for-bit (default)
+#   'float32' → halves GPU memory footprint and memory-bandwidth cost;
+#               introduces ~1e-7 relative error per Manning step — validate
+#               hydrograph output before enabling in production runs.
+GPU_PRECISION = 'float64'
 

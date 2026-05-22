@@ -43,7 +43,6 @@ from precip_input import PrecipEngine
 # ── OPM physical constants ────────────────────────────────────────────────────
 SD_MIN = 0.001          # m   minimum saturation deficit
 Q_MIN  = 0.001          # m³/s  minimum discharge (Eq 10)
-K_MS   = 44.0 / 86400.0  # m/s  saturated hydraulic conductivity (44 m/day)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +108,7 @@ def run_opm(cfg):
     SD_max_initial = float(cfg.OPM_SD_MAX_INITIAL)
     Q_max          = float(cfg.OPM_Q_MAX)
     phi            = float(getattr(cfg, 'OPM_PHI', 0.35))
+    K_MS           = float(getattr(cfg, 'OPM_K_SAT', 44.0)) / 86400.0  # m/day → m/s
 
     if Q_max <= Q_MIN:
         raise ValueError(
@@ -142,7 +142,7 @@ def run_opm(cfg):
     print(f"    SD_max_initial = {SD_max_initial:.4f} m")
     print(f"    Q_max          = {Q_max:.4f} m³/s")
     print(f"    phi (porosity) = {phi:.3f}")
-    print(f"    K (hyd. cond.) = {K_MS*86400:.1f} m/day = {K_MS:.2e} m/s")
+    print(f"    K_sat          = {K_MS*86400:.1f} m/day = {K_MS:.2e} m/s")
     print(f"    A_1            = {A_1:.1f} m²  (single cell)")
     print(f"    A_outlet       = {A_outlet:.3e} m²  (total catchment)")
     print(f"    A_t_init [Eq10]= {A_t_init:.3e} m²")

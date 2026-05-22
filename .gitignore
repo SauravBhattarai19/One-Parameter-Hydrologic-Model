@@ -1,7 +1,10 @@
 # Output folder
 output/
 presentation/
-tools/
+outputs collection/
+
+# Test data (large generated/downloaded files)
+test_data/
 
 # Python
 __pycache__/

@@ -26,9 +26,10 @@ import numpy as np
 import pandas as pd
 
 import config
-import routing_utils as ru
+import routing_utils as ru          # default CPU module; overridden per-call in GPU mode
 import precip_input as pi
 import runoff_input as ri
+import gpu_utils
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,25 +46,50 @@ def initialise_grid(cfg):
     print("KINEMATIC WAVE ROUTER  –  Grid Initialisation")
     print("=" * 60)
 
+    # ── Backend selection ─────────────────────────────────────────────────────
+    # Select routing/precip/runoff modules before any computation so the
+    # vectorized GPU variants of compute_slope_grid and build_downstream_map
+    # are used when BACKEND='gpu'.
+    _backend = getattr(cfg, 'BACKEND', 'cpu').lower()
+    _use_gpu  = (_backend == 'gpu') and gpu_utils.cupy_available()
+
+    if _use_gpu:
+        import cupy as cp
+        import routing_utils_gpu as _ru
+        from precip_input_gpu import PrecipEngineGPU  as _PrecipEngine
+        from runoff_input_gpu  import RunoffEngineGPU  as _RunoffEngine
+        xp = cp
+        print("  Backend: GPU (CuPy)")
+    else:
+        _ru = ru   # module-level routing_utils
+        from precip_input import PrecipEngine as _PrecipEngine
+        from runoff_input  import RunoffEngine as _RunoffEngine
+        xp = np
+        if _backend == 'gpu':
+            print("  [WARNING] BACKEND='gpu' requested but CuPy is unavailable "
+                  "or no CUDA device found — falling back to CPU.")
+        else:
+            print("  Backend: CPU (NumPy)")
+
     # --- Load rasters ---
-    dem, fdir, faccum, ws_mask, transform, nodata_dem, cell_size = ru.load_rasters(cfg)
+    dem, fdir, faccum, ws_mask, transform, nodata_dem, cell_size = _ru.load_rasters(cfg)
     nrows, ncols = dem.shape
 
     # --- Slope grid ---
     print("  Computing slope grid...")
-    slope_2d = ru.compute_slope_grid(
+    slope_2d = _ru.compute_slope_grid(
         dem, fdir, ws_mask, cell_size, cfg.MIN_SLOPE, nodata_dem
     )
 
     # --- Topological order ---
     print("  Building topological order...")
-    s_rows, s_cols, outlet_rc = ru.topological_order(faccum, fdir, ws_mask)
+    s_rows, s_cols, outlet_rc = _ru.topological_order(faccum, fdir, ws_mask)
     n_cells = len(s_rows)
     print(f"  Total active cells: {n_cells:,}")
 
     # --- Downstream neighbour map ---
     print("  Building downstream neighbour map...")
-    ds_idx = ru.build_downstream_map(
+    ds_idx = _ru.build_downstream_map(
         s_rows, s_cols, fdir, ws_mask, nrows, ncols
     )
 
@@ -96,15 +122,29 @@ def initialise_grid(cfg):
         "transform"  : transform,
     }
 
+    # ── Transfer hot arrays to GPU (must happen BEFORE engine construction) ───
+    # Engines read grid_data['faccum_1d'] and grid_data['slope_1d'] during
+    # __init__; they must already be CuPy arrays so engine state is on GPU.
+    if _use_gpu:
+        _dtype    = gpu_utils.get_dtype(cfg)
+        slope_1d  = gpu_utils.to_device(slope_1d.astype(_dtype),  xp)
+        ds_idx    = gpu_utils.to_device(ds_idx,                    xp)
+        faccum_1d = gpu_utils.to_device(faccum_1d.astype(_dtype),  xp)
+        grid_data["slope_1d"]  = slope_1d
+        grid_data["ds_idx"]    = ds_idx
+        grid_data["faccum_1d"] = faccum_1d
+
+    grid_data["xp"] = xp   # carried into run_time_loop
+
     # Build precipitation engine (uses grid_data for spatial weight construction)
     print("  Building precipitation engine...")
-    grid_data["precip_engine"] = pi.PrecipEngine(cfg, grid_data)
+    grid_data["precip_engine"] = _PrecipEngine(cfg, grid_data)
 
     # Build runoff generation engine (optional; None when RUNOFF_SOURCE='none')
     _rsrc = getattr(cfg, 'RUNOFF_SOURCE', 'none').lower()
     if _rsrc != 'none':
         print("  Building runoff generation engine...")
-        grid_data["runoff_engine"] = ri.RunoffEngine(cfg, grid_data)
+        grid_data["runoff_engine"] = _RunoffEngine(cfg, grid_data)
     else:
         grid_data["runoff_engine"] = None
 
@@ -150,11 +190,16 @@ def run_time_loop(grid_data, cfg):
     precip_engine  = grid_data["precip_engine"]
     runoff_engine  = grid_data.get("runoff_engine")   # None when RUNOFF_SOURCE='none'
 
-    # State arrays (1-D over active cells, topological order)
-    volume_1d = np.zeros(n_cells, dtype=np.float64)   # [m³]  water stored per cell
-    Q_out_1d  = np.zeros(n_cells, dtype=np.float64)   # [m³/s] outflow at previous step
+    # ── Array module (numpy or cupy) ─────────────────────────────────────────
+    xp     = grid_data.get("xp", np)
+    _dtype = gpu_utils.get_dtype(cfg)
 
-    hydrograph = []  # list of (time_seconds, Q_m3s)
+    # State arrays on the correct device (CPU or GPU)
+    volume_1d = xp.zeros(n_cells, dtype=_dtype)   # [m³]  water stored per cell
+    Q_out_1d  = xp.zeros(n_cells, dtype=_dtype)   # [m³/s] outflow at previous step
+    inflow_1d = xp.zeros(n_cells, dtype=_dtype)   # [m³/s] upstream inflow buffer
+
+    hydrograph = []  # list of (time_seconds, Q_m3s) — Python floats
 
     print("=" * 60)
     print(f"TIME LOOP  |  steps={n_steps:,}  dt={dt}s  "
@@ -165,7 +210,9 @@ def run_time_loop(grid_data, cfg):
     # For a 1 m deep cell at the steepest slope, compute V and the Courant number.
     # If C > 1, the explicit scheme is conditionally unstable and the flux
     # limiter is critical. Print an advisory so the user can reduce dt if needed.
-    V_at_1m_max_slope = (1.0 / n) * (1.0 ** (2.0 / 3.0)) * (slope_1d.max() ** 0.5)
+    # Use .item() so the comparison works for both CuPy and NumPy scalars.
+    max_slope         = float(slope_1d.max().item())
+    V_at_1m_max_slope = (1.0 / n) * (1.0 ** (2.0 / 3.0)) * (max_slope ** 0.5)
     C_indicator       = V_at_1m_max_slope * dt / dx
     safe_dt           = dx / V_at_1m_max_slope
     if C_indicator > 1.0:
@@ -176,6 +223,11 @@ def run_time_loop(grid_data, cfg):
         print(f"  [CFL OK] Courant indicator C={C_indicator:.2f} at steepest slope.")
     print()
 
+    # ── Pre-compute static scatter-add masks (ds_idx never changes) ──────────
+    valid_ds     = ds_idx >= 0          # mask: cell has a valid downstream neighbour
+    ds_positions = ds_idx[valid_ds]     # downstream position indices
+
+    Q_outlet     = 0.0                  # initialise for progress reporting
     t_wall_start = time.time()
 
     for step in range(n_steps):
@@ -185,20 +237,13 @@ def run_time_loop(grid_data, cfg):
         rain_1d = precip_engine.get_field_1d(t_seconds)   # [m/s], (n_cells,)
 
         # ── 2. Inflow buffer: accumulates Q_out from upstream cells ──────────
-        # Reset to zero at the beginning of each step; then each cell adds
-        # its Q_out to its downstream neighbour's slot.
-        inflow_1d = np.zeros(n_cells, dtype=np.float64)
+        # Reuse the pre-allocated buffer — fill(0) avoids per-step allocation.
+        # gpu_utils.scatter_add dispatches to cupyx.scatter_add (GPU) or
+        # numpy.add.at (CPU); both are atomic-safe.
+        inflow_1d.fill(0)
+        gpu_utils.scatter_add(inflow_1d, ds_positions, Q_out_1d[valid_ds])
 
-        # Pass upstream outflow to downstream cells.
-        # Because we process cells in topological order (upstream → downstream),
-        # by the time we reach cell i the inflow_1d[i] already contains the
-        # contributions of ALL upstream cells processed before it.
-        # Here we pre-fill using the PREVIOUS step's Q_out values.
-        valid_ds     = ds_idx >= 0                    # mask: has a valid downstream
-        ds_positions = ds_idx[valid_ds]               # positions of downstream cells
-        np.add.at(inflow_1d, ds_positions, Q_out_1d[valid_ds])
-
-        # ── 3. Update each cell (vectorised where possible) ──────────────────
+        # ── 3. Update each cell (vectorised) ─────────────────────────────────
         #
         # Volume balance:
         #   V_new = V_old + rain*cell_area*dt + Q_in*dt - Q_out*dt
@@ -209,18 +254,18 @@ def run_time_loop(grid_data, cfg):
         #   - Then V is advanced with that Q_out
         # This is the standard explicit kinematic-wave approach.
 
-        depth_1d = volume_1d / cell_area                         # [m]
+        depth_1d = xp.maximum(volume_1d / cell_area, cfg.MIN_DEPTH_M)   # [m]
         # Floor only — no ceiling. A depth cap freezes Manning Q at the cap
         # value while volume keeps growing, creating a permanent flat plateau.
         # The flux limiter already prevents numerical runaway; deeper cells
         # simply get larger Q_out and drain faster (physically correct).
-        depth_1d = np.maximum(depth_1d, cfg.MIN_DEPTH_M)
 
         velocity_1d = ru.mannings_velocity(depth_1d, slope_1d, n)      # [m/s]
         Q_out_1d    = ru.cell_discharge(depth_1d, velocity_1d, dx)     # [m³/s]
         # Apply volume-conservative CFL limiter: a cell cannot eject more
         # water than it stores in one time step (prevents Courant runaway).
-        Q_out_1d    = ru.flux_limiter(Q_out_1d, volume_1d, dt)         # [m³/s]
+        # Inlined with xp.minimum/xp.maximum so it works on both CPU and GPU.
+        Q_out_1d = xp.minimum(Q_out_1d, xp.maximum(volume_1d, 0.0) / dt)
 
         # Volume advance
         # If a RunoffEngine is active, convert rainfall to effective runoff first
@@ -237,10 +282,19 @@ def run_time_loop(grid_data, cfg):
                       + rain_vol
                       + inflow_1d * dt
                       - Q_out_1d  * dt)
-        volume_1d  = np.maximum(volume_1d, 0.0)     # no negative storage
+        volume_1d  = xp.maximum(volume_1d, 0.0)     # no negative storage
 
         # ── 4. Record outlet hydrograph (at output interval, not every step) ───
-        Q_outlet = Q_out_1d[outlet_pos]
+        # Evaluate Q_outlet only when needed to minimise GPU→CPU transfers.
+        _need_q = (
+            (step + 1) % write_every == 0
+            or step == n_steps - 1
+            or (step + 1) % max(1, n_steps // 10) == 0
+        )
+        if _need_q:
+            # .item() converts CuPy 0-d → Python float (8-byte D→H); no-op on NumPy.
+            Q_outlet = float(Q_out_1d[outlet_pos].item())
+
         if (step + 1) % write_every == 0 or step == n_steps - 1:
             hydrograph.append((t_seconds + dt, Q_outlet))
 
