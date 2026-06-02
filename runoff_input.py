@@ -32,7 +32,119 @@ import os
 # ── OPM physical constants (Pradhan & Ogden 2010) ────────────────────────────
 _OPM_SD_MIN = 0.001          # m   minimum saturation deficit
 _OPM_Q_MIN  = 0.001          # m³/s  minimum discharge (Eq 10)
-_OPM_K_MS   = 44.0 / 86400.0  # m/s  saturated hydraulic conductivity (44 m/day)
+
+
+def _resolve_ksat(cfg, cell_size, gauge_csv, gee_result):
+    """
+    Resolve K_sat from config or HiHydroSoil via GEE.
+
+    Returns (ksat_ms, ksat_per_polygon_ms_or_None).
+    """
+    ksat_manual = float(getattr(cfg, 'OPM_K_SAT', 44.0)) / 86400.0
+    ksat_source = getattr(cfg, 'OPM_KSAT_SOURCE', 'manual').lower()
+
+    if ksat_source != 'gee' or gee_result is None:
+        return ksat_manual, None
+
+    ksat_gee = gee_result.get('ksat_m_day')
+    ksat_ms = ksat_gee / 86400.0 if ksat_gee is not None else ksat_manual
+
+    ksat_pp = gee_result.get('ksat_per_polygon')
+    ksat_pp_ms = [v / 86400.0 for v in ksat_pp] if ksat_pp else None
+
+    return ksat_ms, ksat_pp_ms
+
+
+def _resolve_sd_params(cfg, cell_size):
+    """
+    Resolve OPM soil parameters from config (manual) or GEE.
+
+    Returns dict with keys: sd_max, sd_min, phi, sd_max_per_polygon,
+    ksat_ms, ksat_per_polygon_ms.
+    """
+    sd_source   = getattr(cfg, 'OPM_SD_SOURCE', 'manual').lower()
+    ksat_source = getattr(cfg, 'OPM_KSAT_SOURCE', 'manual').lower()
+    ksat_manual = float(getattr(cfg, 'OPM_K_SAT', 44.0)) / 86400.0
+
+    _manual_params = {
+        'sd_max': float(cfg.OPM_SD_MAX_INITIAL),
+        'sd_min': _OPM_SD_MIN,
+        'phi': float(getattr(cfg, 'OPM_PHI', 0.10)),
+        'sd_max_per_polygon': None,
+        'ksat_ms': ksat_manual,
+        'ksat_per_polygon_ms': None,
+    }
+
+    needs_gee = sd_source == 'gee' or ksat_source == 'gee'
+    if not needs_gee:
+        return _manual_params
+
+    target_date = getattr(cfg, 'SERVES_TARGET_DATE', None)
+    if target_date is None and sd_source == 'gee':
+        print("  [WARN] SERVES_TARGET_DATE not set; using manual SD/phi values.")
+
+    try:
+        from serves_gee import compute_opm_params
+    except ImportError:
+        print("  [WARN] earthengine-api not installed; using manual values.")
+        return _manual_params
+
+    gauge_csv = getattr(cfg, 'PRECIP_GAUGE_FILE', None)
+    precip_method = getattr(cfg, 'PRECIP_METHOD', 'uniform').lower()
+    if precip_method not in ('thiessen', 'idw'):
+        gauge_csv = None
+
+    gee_result = compute_opm_params(
+        watershed_geojson_path=getattr(cfg, 'OPM_WATERSHED_GEOJSON',
+                                       'output/watershed.geojson'),
+        cell_size=cell_size,
+        lookup_csv_path=getattr(cfg, 'LULC_LOOKUP_CSV', 'lulc_lookup.csv'),
+        target_date=target_date,
+        satellite=getattr(cfg, 'SERVES_SATELLITE', 'landsat'),
+        search_window=getattr(cfg, 'SERVES_SEARCH_WINDOW', 16),
+        soil_depth_band=getattr(cfg, 'OPM_SOILGRIDS_DEPTH', 'b30'),
+        project=getattr(cfg, 'GEE_PROJECT', None),
+        gauge_csv_path=gauge_csv,
+        target_crs=getattr(cfg, 'TARGET_CRS_EPSG', 'EPSG:32645'),
+    )
+
+    # ── SD / phi: from GEE or manual ─────────────────────────────────────
+    if sd_source == 'gee' and gee_result is not None and target_date is not None:
+        sd_max  = gee_result['sd_max']
+        phi     = gee_result['phi']
+        per_poly = gee_result.get('sd_max_per_polygon')
+    else:
+        sd_max  = float(cfg.OPM_SD_MAX_INITIAL)
+        phi     = float(getattr(cfg, 'OPM_PHI', 0.10))
+        per_poly = None
+
+    # ── K_sat: from GEE or manual ────────────────────────────────────────
+    ksat_ms, ksat_pp_ms = _resolve_ksat(cfg, cell_size, gauge_csv, gee_result)
+
+    # ── Print diagnostics ────────────────────────────────────────────────
+    print(f"  OPM params    |  SD_max={sd_max:.4f} m  (source={sd_source})"
+          f"  phi={phi:.4f}"
+          f"  K_sat={ksat_ms * 86400:.2f} m/day (source={ksat_source})")
+    if gee_result is not None:
+        print(f"                |  theta=[{gee_result.get('theta_min', 0):.3f},"
+              f" {gee_result.get('theta_max', 0):.3f}]"
+              f"  Z_r_mean={gee_result.get('root_depth_mean', 0):.2f} m")
+    if per_poly:
+        print(f"                |  Per-polygon SD_max: "
+              f"{[f'{v:.3f}' for v in per_poly]}")
+    if ksat_pp_ms:
+        ksat_pp_mday = [v * 86400 for v in ksat_pp_ms]
+        print(f"                |  Per-polygon K_sat:  "
+              f"{[f'{v:.2f}' for v in ksat_pp_mday]} m/day")
+
+    return {
+        'sd_max': sd_max,
+        'sd_min': _OPM_SD_MIN,
+        'phi': phi,
+        'sd_max_per_polygon': per_poly,
+        'ksat_ms': ksat_ms,
+        'ksat_per_polygon_ms': ksat_pp_ms,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,17 +256,24 @@ class RunoffEngine:
     def get_opm_diagnostics(self):
         """
         Return current OPM state as a dict (vsa_opm mode only).
-        Keys: z_m, SD_max_t, A_t_m2, VSA_m2, VSA_fraction.
+
+        Per-polygon mode: z_m, SD_max_t, A_t_m2 are (n_polygons,) arrays.
+        Single mode:      z_m, SD_max_t, A_t_m2 are scalars.
+        VSA_m2 and VSA_fraction are always scalar (catchment-wide totals).
         """
         if self._mode != 'vsa_opm':
             return {}
-        return {
-            "z_m":         self._opm_z,
-            "SD_max_t":    self._opm_SD_max,
-            "A_t_m2":      self._opm_A_t,
-            "VSA_m2":      float(self._vsa_mask.sum()) * self._cell_area,
+        d = {
+            "z_m":          self._opm_z.copy() if self._per_polygon else self._opm_z,
+            "SD_max_t":     self._opm_SD_max.copy() if self._per_polygon else self._opm_SD_max,
+            "A_t_m2":       self._opm_A_t.copy() if self._per_polygon else self._opm_A_t,
+            "VSA_m2":       float(self._vsa_mask.sum()) * self._cell_area,
             "VSA_fraction": float(self._vsa_mask.sum()) / self._n_cells,
+            "per_polygon":  self._per_polygon,
         }
+        if self._per_polygon:
+            d["n_polygons"] = self._n_polygons
+        return d
 
     # ── Mode: 'coefficient' ───────────────────────────────────────────────────
 
@@ -265,6 +384,12 @@ class RunoffEngine:
 
         Implements Pradhan & Ogden (2010) Equations 4, 5, 10, 12.
         H_a is computed from Eq 4 using the initial A_t from Eq 10.
+
+        Per-polygon mode (Thiessen / IDW):
+            When cell_polygon is available in grid_data, each precipitation zone
+            gets its own sandbox (z, SD_max, A_t).  The divide cell per zone is
+            the cell with minimum flow accumulation within that zone.
+            Catchment-wide constants (H_a, A_1, A_outlet) remain shared.
         """
         Q_max = float(cfg.OPM_Q_MAX)
         if Q_max <= _OPM_Q_MIN:
@@ -279,113 +404,204 @@ class RunoffEngine:
 
         self._cell_area    = cell_area
         self._cell_size    = cell_size
-        self._slope_divide = float(slope_1d[0])   # divide cell = index 0 (min faccum)
 
         # Upslope contributing area per cell [m²] — computed once
         self._upslope_area = faccum_1d * cell_area   # (n_cells,) [m²]
 
         # ── OPM scalars ───────────────────────────────────────────────────────
-        SD_max_initial = float(cfg.OPM_SD_MAX_INITIAL)
-        phi            = float(getattr(cfg, 'OPM_PHI', 0.35))
+        params = _resolve_sd_params(cfg, cell_size)
+        SD_max_initial  = params['sd_max']
+        sd_min          = params['sd_min']
+        phi             = params['phi']
+        sd_max_per_poly = params['sd_max_per_polygon']
+        ksat_ms         = params['ksat_ms']
+        ksat_pp_ms      = params['ksat_per_polygon_ms']
 
-        self._SD_max_initial = SD_max_initial
-        self._phi            = phi
+        self._sd_min  = sd_min
+        self._phi     = phi
+        self._ksat_ms = ksat_ms
 
         # A_1: upslope area of a single divide cell [m²]
         A_1 = cell_area
 
         # A_outlet: total catchment area [m²]
-        # faccum_1d[-1] == faccum[outlet_rc] because topological_order puts
-        # the outlet last (highest accumulation).
         A_outlet = float(faccum_1d[-1]) * cell_area
 
         # Eq 10 — initial threshold contributing area from single discharge measurement
-        # A_t_init = A_outlet / (1 - ln(Q_min / Q_max))
-        # Derivation in Pradhan & Ogden (2010) implicitly sets H_a=1 for this equation.
         A_t_init = A_outlet / (1.0 - np.log(_OPM_Q_MIN / Q_max))
 
-        # Initial range factor
-        Rf_init = _OPM_SD_MIN / SD_max_initial
-
-        # Eq 4 — scaling factor H_a (constant for all timesteps)
-        # H_a = (A_t_init / (A_t_init - A_1)) * ln(Rf_init)
-        # H_a < 0 since ln(Rf_init) < 0 (Rf_init < 1)
-        # For large watersheds (A_t_init >> A_1): H_a ≈ ln(Rf_init)
-        # Self-consistency: plugging A_t_init and Rf_init into Eq 5 recovers A_t_init exactly.
+        # Eq 4 ratio (shared — A_t_init comes from watershed-level Q_max)
         ratio = A_t_init / (A_t_init - A_1)
-        H_a   = ratio * np.log(Rf_init)   # negative
 
-        # Store for dynamic updates
+        # Store catchment-wide constants
         self._opm_A_1      = A_1
         self._opm_A_outlet = A_outlet
         self._opm_A_t_init = A_t_init
-        self._opm_H_a      = H_a
-
-        # State variables (updated each timestep by _update_opm_sandbox)
-        self._opm_z      = 0.0            # saturated zone thickness [m]
-        self._opm_SD_max = SD_max_initial  # current max deficit [m]
-        self._opm_A_t    = A_t_init       # current threshold area [m²]
-
-        # Initial VSA mask: cells with upslope_area > A_t_init
-        self._vsa_mask = self._upslope_area > A_t_init
 
         # Extensibility hook: records which A_t initialisation method was used.
-        # Future options: 'single_measurement', 'regression', 'baseflow_recession'.
         self._at_method = 'single_measurement'
 
-        print(f"  OPM           |  A_outlet={A_outlet:.3e} m²"
-              f"  A_t_init={A_t_init:.3e} m²")
-        print(f"                |  H_a={H_a:.4f}  SD_max_init={SD_max_initial} m"
-              f"  phi={phi}  Q_max={Q_max} m³/s")
-        print(f"                |  Initial VSA={self._vsa_mask.sum():,} cells"
-              f" ({100*self._vsa_mask.mean():.1f}% of watershed)")
+        # ── Per-polygon vs single-sandbox branching ───────────────────────────
+        cell_polygon = grid_data.get('cell_polygon')
+        use_per_polygon = getattr(cfg, 'OPM_PER_POLYGON', True)
+
+        if cell_polygon is not None and use_per_polygon:
+            # ── Per-polygon mode ──────────────────────────────────────────────
+            # Each precipitation zone (nearest-gauge region) gets its own
+            # sandbox state so that spatially variable rainfall drives local
+            # VSA expansion independently.
+            cell_polygon = np.asarray(cell_polygon).ravel()
+            n_polygons   = int(cell_polygon.max()) + 1
+
+            # Ensure NumPy for the init loop (faccum_1d / slope_1d may be CuPy)
+            _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+            faccum_np = _to_np(faccum_1d)
+            slope_np  = _to_np(slope_1d)
+
+            divide_idx     = np.empty(n_polygons, dtype=np.intp)
+            slope_divide   = np.empty(n_polygons, dtype=np.float64)
+
+            for p in range(n_polygons):
+                local_idx = np.where(cell_polygon == p)[0]
+                best      = local_idx[faccum_np[local_idx].argmin()]
+                divide_idx[p]   = best
+                slope_divide[p] = float(slope_np[best])
+
+            self._per_polygon          = True
+            self._n_polygons           = n_polygons
+            self._cell_polygon         = cell_polygon
+            self._polygon_divide_idx   = divide_idx
+            self._polygon_slope_divide = slope_divide
+
+            # Per-polygon SD_max_initial and H_a
+            if (sd_max_per_poly is not None
+                    and len(sd_max_per_poly) == n_polygons):
+                sd_init_arr = np.array(sd_max_per_poly, dtype=np.float64)
+            else:
+                sd_init_arr = np.full(n_polygons, SD_max_initial,
+                                      dtype=np.float64)
+            self._SD_max_initial = sd_init_arr
+
+            # Per-polygon K_sat
+            if (ksat_pp_ms is not None
+                    and len(ksat_pp_ms) == n_polygons):
+                self._ksat_ms = np.array(ksat_pp_ms, dtype=np.float64)
+            else:
+                self._ksat_ms = np.full(n_polygons, ksat_ms,
+                                         dtype=np.float64)
+
+            Rf_init_arr = sd_min / sd_init_arr
+            H_a_arr = ratio * np.log(Rf_init_arr)
+            self._opm_H_a = H_a_arr
+
+            # Per-polygon state arrays
+            self._opm_z      = np.zeros(n_polygons, dtype=np.float64)
+            self._opm_SD_max = sd_init_arr.copy()
+            self._opm_A_t    = np.full(n_polygons, A_t_init, dtype=np.float64)
+
+            # Initial VSA mask
+            A_t_per_cell = self._opm_A_t[cell_polygon]
+            if hasattr(self._upslope_area, '__cuda_array_interface__'):
+                import cupy as _cp
+                A_t_per_cell = _cp.asarray(A_t_per_cell)
+            self._vsa_mask = self._upslope_area > A_t_per_cell
+
+            print(f"  OPM           |  A_outlet={A_outlet:.3e} m²"
+                  f"  A_t_init={A_t_init:.3e} m²")
+            print(f"                |  H_a={H_a_arr}  phi={phi}  Q_max={Q_max} m³/s")
+            print(f"                |  SD_max_init={sd_init_arr}")
+            print(f"                |  Per-polygon mode: {n_polygons} zones")
+            print(f"                |  Initial VSA={self._vsa_mask.sum():,} cells"
+                  f" ({100*self._vsa_mask.mean():.1f}% of watershed)")
+        else:
+            # ── Single-sandbox mode (uniform rainfall) ────────────────────────
+            self._per_polygon  = False
+            self._slope_divide = float(slope_1d[0])
+
+            self._SD_max_initial = SD_max_initial  # scalar
+            Rf_init = sd_min / SD_max_initial
+            H_a = ratio * np.log(Rf_init)
+            self._opm_H_a = H_a  # scalar
+
+            # Scalar state variables
+            self._opm_z      = 0.0
+            self._opm_SD_max = SD_max_initial
+            self._opm_A_t    = A_t_init
+
+            self._vsa_mask = self._upslope_area > A_t_init
+
+            print(f"  OPM           |  A_outlet={A_outlet:.3e} m²"
+                  f"  A_t_init={A_t_init:.3e} m²")
+            print(f"                |  H_a={H_a:.4f}  SD_max_init={SD_max_initial} m"
+                  f"  phi={phi}  Q_max={Q_max} m³/s")
+            print(f"                |  Initial VSA={self._vsa_mask.sum():,} cells"
+                  f" ({100*self._vsa_mask.mean():.1f}% of watershed)")
+
+    # ── OPM sandbox update ────────────────────────────────────────────────────
 
     def _update_opm_sandbox(self, rain_1d, dt):
+        """Advance OPM sandbox state by one timestep (dispatches to mode)."""
+        if self._per_polygon:
+            self._update_opm_sandbox_per_polygon(rain_1d, dt)
+        else:
+            self._update_opm_sandbox_single(rain_1d, dt)
+
+    def _update_opm_sandbox_single(self, rain_1d, dt):
         """
-        Advance OPM sandbox state by one timestep.
+        Single-sandbox update (original Pradhan & Ogden 2010, Eq 12).
 
-        Physics (Pradhan & Ogden 2010, Eq 12):
-          - Rainfall infiltrates at the catchment divide (zero upstream area).
-          - Water table z rises under precipitation; lateral Darcy flow drains it.
-          - SD_max(t) = SD_max(1) - z(t)   [deficit decreases as table rises]
-          - A_t(t) from Eq 5 decreases as SD_max decreases → VSA expands.
-
-        Units:
-          P_divide  [m/s]
-          q_b = K * i * z * b  →  [m/s][m/m][m][m] = [m³/s]
-          dV  [m³],  dz [m]
+        Rainfall at the catchment divide (index 0) drives the water balance.
         """
-        P_divide = float(rain_1d[0])   # m/s — rainfall at divide cell (index 0)
+        P_divide = float(rain_1d[0])
 
-        # Darcy lateral outflow from saturated zone
-        q_b = _OPM_K_MS * self._slope_divide * self._opm_z * self._cell_size  # [m³/s]
+        q_b = self._ksat_ms * self._slope_divide * self._opm_z * self._cell_size
+        dV  = (P_divide * self._cell_area - q_b) * dt
+        dz  = dV / (self._cell_area * self._phi)
+        self._opm_z = max(0.0, self._opm_z + dz)
 
-        # Net volume change in divide cell
-        dV  = (P_divide * self._cell_area - q_b) * dt                         # [m³]
+        self._opm_SD_max = max(self._sd_min, self._SD_max_initial - self._opm_z)
 
-        # Update saturated zone thickness (bounded below by 0)
-        dz            = dV / (self._cell_area * self._phi)
-        self._opm_z   = max(0.0, self._opm_z + dz)
-
-        # Eq 12: updated maximum deficit (bounded below by SD_min)
-        self._opm_SD_max = max(_OPM_SD_MIN, self._SD_max_initial - self._opm_z)
-
-        # Dynamic range factor
-        Rf_t  = _OPM_SD_MIN / self._opm_SD_max
-
-        # Eq 5: updated threshold contributing area
-        # A_t(t) = H_a * A_1 / (H_a - ln(Rf_t))
-        # As rain falls: SD_max ↓ → Rf_t ↑ → |ln(Rf_t)| ↓ → |denom| ↑ → A_t ↓ → VSA ↑
+        Rf_t  = self._sd_min / self._opm_SD_max
         denom = self._opm_H_a - np.log(Rf_t)
         if abs(denom) < 1e-12:
-            # Singularity guard: occurs only when Rf_t == Rf_init (at t=0).
-            # The initial condition A_t_init is already set; no update needed.
             new_A_t = self._opm_A_t_init
         else:
             new_A_t = self._opm_H_a * self._opm_A_1 / denom
 
-        # Physical bounds: A_t in [A_1, A_outlet]
         self._opm_A_t = float(np.clip(new_A_t, self._opm_A_1, self._opm_A_outlet))
-
-        # Recompute VSA mask for the NEXT get_effective_1d call
         self._vsa_mask = self._upslope_area > self._opm_A_t
+
+    def _update_opm_sandbox_per_polygon(self, rain_1d, dt):
+        """
+        Per-polygon sandbox update.
+
+        Each precipitation zone has its own divide cell, saturated zone
+        thickness z[p], SD_max[p], and threshold area A_t[p].  The VSA mask
+        is rebuilt from per-cell polygon assignments after all zones update.
+        """
+        for p in range(self._n_polygons):
+            P_div = float(rain_1d[self._polygon_divide_idx[p]])
+
+            z_p = self._opm_z[p]
+            q_b = self._ksat_ms[p] * self._polygon_slope_divide[p] * z_p * self._cell_size
+            dV  = (P_div * self._cell_area - q_b) * dt
+            dz  = dV / (self._cell_area * self._phi)
+            z_p = max(0.0, z_p + dz)
+            self._opm_z[p] = z_p
+
+            SD_max_p = max(self._sd_min, self._SD_max_initial[p] - z_p)
+            self._opm_SD_max[p] = SD_max_p
+
+            Rf_t  = self._sd_min / SD_max_p
+            H_a_p = self._opm_H_a[p]
+            denom = H_a_p - np.log(Rf_t)
+            if abs(denom) < 1e-12:
+                self._opm_A_t[p] = self._opm_A_t_init
+            else:
+                new_A_t = H_a_p * self._opm_A_1 / denom
+                self._opm_A_t[p] = float(np.clip(new_A_t, self._opm_A_1,
+                                                  self._opm_A_outlet))
+
+        # Vectorised VSA mask rebuild: each cell uses its polygon's A_t
+        A_t_per_cell   = self._opm_A_t[self._cell_polygon]
+        self._vsa_mask = self._upslope_area > A_t_per_cell

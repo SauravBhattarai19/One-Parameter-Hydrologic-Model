@@ -41,8 +41,14 @@ import routing_utils as ru
 from precip_input import PrecipEngine
 
 # ── OPM physical constants ────────────────────────────────────────────────────
-SD_MIN = 0.001          # m   minimum saturation deficit
+SD_MIN = 0.001          # m   minimum saturation deficit (default floor)
 Q_MIN  = 0.001          # m³/s  minimum discharge (Eq 10)
+
+
+def _resolve_sd_params(cfg, cell_size):
+    """Resolve OPM soil parameters — mirrors runoff_input._resolve_sd_params."""
+    from runoff_input import _resolve_sd_params as _resolve
+    return _resolve(cfg, cell_size)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,10 +111,14 @@ def run_opm(cfg):
 
     # ── 6. OPM Initialisation ─────────────────────────────────────────────────
 
-    SD_max_initial = float(cfg.OPM_SD_MAX_INITIAL)
-    Q_max          = float(cfg.OPM_Q_MAX)
-    phi            = float(getattr(cfg, 'OPM_PHI', 0.35))
-    K_MS           = float(getattr(cfg, 'OPM_K_SAT', 44.0)) / 86400.0  # m/day → m/s
+    params = _resolve_sd_params(cfg, cell_size)
+    SD_max_initial  = params['sd_max']
+    sd_min          = params['sd_min']
+    phi             = params['phi']
+    sd_max_per_poly = params['sd_max_per_polygon']
+    K_MS            = params['ksat_ms']
+    ksat_pp_ms      = params['ksat_per_polygon_ms']
+    Q_max = float(cfg.OPM_Q_MAX)
 
     if Q_max <= Q_MIN:
         raise ValueError(
@@ -122,33 +132,79 @@ def run_opm(cfg):
     A_outlet = float(faccum[outlet_rc]) * cell_area
 
     # Eq 10 — initial threshold contributing area (single discharge measurement)
-    # A_t_init = A_outlet / (1 - ln(Q_min / Q_max))
     A_t_init = A_outlet / (1.0 - math.log(Q_MIN / Q_max))
 
-    # Eq 4 — scaling factor H_a (constant, negative)
-    Rf_init = SD_MIN / SD_max_initial
-    ratio   = A_t_init / (A_t_init - A_1)
-    H_a     = ratio * math.log(Rf_init)   # < 0
-
-    # Verify self-consistency: Eq 5 with Rf_init should recover A_t_init
-    _denom_check = H_a - math.log(Rf_init)
-    if abs(_denom_check) > 1e-6:
-        # For large watersheds (A_t_init >> A_1) the denominator is small but
-        # nonzero; A_t computed from Eq 5 equals A_t_init up to floating-point.
-        pass   # expected; singularity only at denom=0
+    ratio = A_t_init / (A_t_init - A_1)
 
     print()
     print(f"  OPM parameters:")
-    print(f"    SD_max_initial = {SD_max_initial:.4f} m")
+    print(f"    SD_max_initial = {SD_max_initial}")
     print(f"    Q_max          = {Q_max:.4f} m³/s")
     print(f"    phi (porosity) = {phi:.3f}")
     print(f"    K_sat          = {K_MS*86400:.1f} m/day = {K_MS:.2e} m/s")
     print(f"    A_1            = {A_1:.1f} m²  (single cell)")
     print(f"    A_outlet       = {A_outlet:.3e} m²  (total catchment)")
     print(f"    A_t_init [Eq10]= {A_t_init:.3e} m²")
-    print(f"    Rf_init        = {Rf_init:.6f}")
-    print(f"    H_a    [Eq 4]  = {H_a:.6f}  (negative)")
-    print(f"    slope_divide   = {slope_divide:.6f} m/m")
+
+    # ── Per-polygon vs single-sandbox ─────────────────────────────────────
+    cell_polygon = precip_engine.cell_polygon
+    use_per_polygon = getattr(cfg, 'OPM_PER_POLYGON', True)
+
+    if cell_polygon is not None and use_per_polygon:
+        # Per-polygon mode: each precipitation zone gets its own sandbox
+        cell_polygon = np.asarray(cell_polygon).ravel()
+        n_polygons   = int(cell_polygon.max()) + 1
+
+        poly_divide_idx   = np.empty(n_polygons, dtype=np.intp)
+        poly_slope_divide = np.empty(n_polygons, dtype=np.float64)
+
+        for p in range(n_polygons):
+            local_idx = np.where(cell_polygon == p)[0]
+            best      = local_idx[faccum_1d[local_idx].argmin()]
+            poly_divide_idx[p]   = best
+            poly_slope_divide[p] = float(slope_1d[best])
+
+        # Per-polygon SD_max_initial and H_a
+        if (sd_max_per_poly is not None
+                and len(sd_max_per_poly) == n_polygons):
+            sd_init_arr = np.array(sd_max_per_poly, dtype=np.float64)
+        else:
+            sd_init_arr = np.full(n_polygons, SD_max_initial, dtype=np.float64)
+
+        # Per-polygon K_sat
+        if (ksat_pp_ms is not None and len(ksat_pp_ms) == n_polygons):
+            ksat_arr = np.array(ksat_pp_ms, dtype=np.float64)
+        else:
+            ksat_arr = np.full(n_polygons, K_MS, dtype=np.float64)
+
+        Rf_init_arr = sd_min / sd_init_arr
+        H_a_arr = ratio * np.log(Rf_init_arr)
+
+        z_arr      = np.zeros(n_polygons)
+        SD_max_arr = sd_init_arr.copy()
+        A_t_arr    = np.full(n_polygons, A_t_init)
+
+        per_polygon = True
+        print(f"    Per-polygon mode: {n_polygons} zones")
+        print(f"    SD_max_init = {sd_init_arr}")
+        print(f"    K_sat       = {[f'{v*86400:.2f}' for v in ksat_arr]} m/day")
+        print(f"    H_a         = {H_a_arr}")
+    else:
+        per_polygon = False
+
+        Rf_init = sd_min / SD_max_initial
+        H_a = ratio * math.log(Rf_init)
+        sd_init_arr = None
+        H_a_arr = None
+
+        print(f"    slope_divide   = {slope_divide:.6f} m/m")
+        print(f"    Rf_init        = {Rf_init:.6f}")
+        print(f"    H_a    [Eq 4]  = {H_a:.6f}  (negative)")
+
+        z        = 0.0
+        A_t      = A_t_init
+        SD_max_t = SD_max_initial
+
     print()
 
     # ── 7. Time loop ──────────────────────────────────────────────────────────
@@ -161,56 +217,86 @@ def run_opm(cfg):
     print(f"  Time loop: {n_steps:,} steps × {dt} s  "
           f"(recording every {write_every} steps)\n")
 
-    # State
-    z        = 0.0            # saturated zone thickness [m]
-    A_t      = A_t_init       # current threshold contributing area [m²]
-    SD_max_t = SD_max_initial  # current max deficit [m]
-
     results     = []
     t_wall_start = time.time()
 
     for step in range(n_steps):
-        t_s = step * dt   # simulation time at start of step
+        t_s = step * dt
 
         # ── Get rainfall for this step ─────────────────────────────────────
-        rain_1d  = precip_engine.get_field_1d(t_s)    # [m/s], (n_cells,)
-        P_divide = float(rain_1d[0])                   # rainfall at divide cell
+        rain_1d = precip_engine.get_field_1d(t_s)    # [m/s], (n_cells,)
 
-        # ── Compute VSA from CURRENT A_t (forward Euler) ──────────────────
-        vsa_mask = upslope_area_1d > A_t               # (n_cells,) bool
-        VSA_m2   = float(vsa_mask.sum()) * cell_area   # [m²]
+        if per_polygon:
+            # ── Per-polygon VSA ────────────────────────────────────────────
+            A_t_per_cell = A_t_arr[cell_polygon]
+            vsa_mask     = upslope_area_1d > A_t_per_cell
+            VSA_m2       = float(vsa_mask.sum()) * cell_area
 
-        # ── Record at output interval ──────────────────────────────────────
-        if (step + 1) % write_every == 0 or step == n_steps - 1:
-            results.append({
-                "time_s"  : t_s + dt,
-                "SD_max_t": SD_max_t,
-                "A_t_m2"  : A_t,
-                "VSA_m2"  : VSA_m2,
-            })
+            # Record (use mean SD_max and A_t for backward-compatible CSV)
+            if (step + 1) % write_every == 0 or step == n_steps - 1:
+                results.append({
+                    "time_s"  : t_s + dt,
+                    "SD_max_t": float(SD_max_arr.mean()),
+                    "A_t_m2"  : float(A_t_arr.mean()),
+                    "VSA_m2"  : VSA_m2,
+                })
 
-        # ── Sandbox water balance (Eq 12) ──────────────────────────────────
-        # Darcy lateral outflow from saturated zone at the divide cell:
-        #   q_b = K * i * z * b  [m³/s]  where i=slope, b=cell_size
-        q_b = K_MS * slope_divide * z * cell_size       # [m³/s]
+            # Update each polygon's sandbox independently
+            for p in range(n_polygons):
+                P_div = float(rain_1d[poly_divide_idx[p]])
+                z_p   = z_arr[p]
 
-        # Net volume change; divide by (cell_area × phi) to get dz [m]
-        dV  = (P_divide * cell_area - q_b) * dt         # [m³]
-        dz  = dV / (cell_area * phi)
-        z   = max(0.0, z + dz)                          # z ≥ 0
+                q_b = ksat_arr[p] * poly_slope_divide[p] * z_p * cell_size
+                dV  = (P_div * cell_area - q_b) * dt
+                dz  = dV / (cell_area * phi)
+                z_p = max(0.0, z_p + dz)
+                z_arr[p] = z_p
 
-        # Updated maximum deficit (Eq 12), floored at SD_min
-        SD_max_t = max(SD_MIN, SD_max_initial - z)
+                sd_p = max(sd_min, sd_init_arr[p] - z_p)
+                SD_max_arr[p] = sd_p
 
-        # ── Eq 5 — updated threshold area ─────────────────────────────────
-        Rf_t  = SD_MIN / SD_max_t
-        denom = H_a - math.log(Rf_t)
-        if abs(denom) < 1e-12:
-            # Singularity at t=0 (Rf_t == Rf_init); keep current value
-            pass
+                Rf_t  = sd_min / sd_p
+                ha_p  = H_a_arr[p]
+                denom = ha_p - math.log(Rf_t)
+                if abs(denom) < 1e-12:
+                    pass   # keep current A_t_arr[p]
+                else:
+                    new_A_t = ha_p * A_1 / denom
+                    A_t_arr[p] = float(np.clip(new_A_t, A_1, A_outlet))
+
+            # Progress (use mean values for display)
+            SD_max_t = float(SD_max_arr.mean())
+            A_t      = float(A_t_arr.mean())
+
         else:
-            new_A_t = H_a * A_1 / denom
-            A_t     = float(np.clip(new_A_t, A_1, A_outlet))
+            # ── Single-sandbox VSA (original) ──────────────────────────────
+            P_divide = float(rain_1d[0])
+
+            vsa_mask = upslope_area_1d > A_t
+            VSA_m2   = float(vsa_mask.sum()) * cell_area
+
+            if (step + 1) % write_every == 0 or step == n_steps - 1:
+                results.append({
+                    "time_s"  : t_s + dt,
+                    "SD_max_t": SD_max_t,
+                    "A_t_m2"  : A_t,
+                    "VSA_m2"  : VSA_m2,
+                })
+
+            q_b = K_MS * slope_divide * z * cell_size
+            dV  = (P_divide * cell_area - q_b) * dt
+            dz  = dV / (cell_area * phi)
+            z   = max(0.0, z + dz)
+
+            SD_max_t = max(sd_min, SD_max_initial - z)
+
+            Rf_t  = sd_min / SD_max_t
+            denom = H_a - math.log(Rf_t)
+            if abs(denom) < 1e-12:
+                pass
+            else:
+                new_A_t = H_a * A_1 / denom
+                A_t     = float(np.clip(new_A_t, A_1, A_outlet))
 
         # Progress reporting
         if (step + 1) % max(1, n_steps // 10) == 0:
@@ -233,8 +319,12 @@ def run_opm(cfg):
     df.to_csv(out_path, index=False, float_format="%.6g")
 
     # Summary
+    if per_polygon:
+        z_final = float(z_arr.mean())
+    else:
+        z_final = z
     print(f"  Results written → {out_path}")
-    print(f"  Final state  :  z={z:.4f} m  "
+    print(f"  Final state  :  z={z_final:.4f} m  "
           f"SD_max={SD_max_t:.5f} m  "
           f"A_t={A_t:.3e} m²  "
           f"VSA={VSA_m2/1e6:.3f} km²")
@@ -242,6 +332,10 @@ def run_opm(cfg):
           f"at t={df.loc[df['VSA_m2'].idxmax(), 'time_s']/3600:.2f} h")
     print(f"  Min A_t: {df['A_t_m2'].min():.3e} m²  "
           f"Min SD_max: {df['SD_max_t'].min():.5f} m")
+    if per_polygon:
+        print(f"  Per-polygon z final: {z_arr}")
+        print(f"  Per-polygon SD_max:  {SD_max_arr}")
+        print(f"  Per-polygon A_t:     {A_t_arr}")
     print()
 
     return df

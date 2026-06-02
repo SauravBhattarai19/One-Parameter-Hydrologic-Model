@@ -1,0 +1,12 @@
+class_code,class_name,root_zone_depth_m,mannings_n
+10,Tree cover,2.0,0.15
+20,Shrubland,1.5,0.10
+30,Grassland,0.8,0.04
+40,Cropland,1.0,0.06
+50,Built-up,0.3,0.015
+60,Bare / sparse vegetation,0.3,0.03
+70,Snow and ice,0.1,0.05
+80,Permanent water bodies,0.1,0.03
+90,Herbaceous wetland,0.5,0.05
+95,Mangroves,0.8,0.07
+100,Moss and lichen,0.3,0.04

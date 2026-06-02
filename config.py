@@ -5,7 +5,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Path to the Digital Elevation Model (DEM) file
-DEM_PATH = "./dem.tif"
+DEM_PATH = "./dem_100m.tif"
 
 # Target Coordinate Reference System (CRS) for reprojection.
 TARGET_CRS_EPSG = "EPSG:32645"
@@ -43,7 +43,7 @@ MANNINGS_N = 0.09
 TIME_STEP_SECONDS = 5           # seconds
 
 # Total length of the simulation
-TOTAL_SIMULATION_TIME_HOURS = 144  # hours  (FLOOD_03: 2024-09-26 to 2024-10-01)
+TOTAL_SIMULATION_TIME_HOURS = 96   # hours  (202409: 2024-09-26 to 2024-09-30, 15-min gauges)
 
 # --- Output write interval ---
 # How often to record a row in hydrograph.csv (seconds of simulation time).
@@ -63,8 +63,8 @@ RAIN_DURATION_HOURS  = 3.0          # hours  (rainfall stops after this; remaind
 #          'idw'      → Inverse Distance Weighting (exponent = PRECIP_IDW_POWER)
 # When using 'thiessen' or 'idw' the rainfall comes from the CSV files below.
 PRECIP_METHOD          = 'thiessen'
-PRECIP_GAUGE_FILE      = "test_data/opm_format/FLOOD_03/gauges.csv"
-PRECIP_TIMESERIES_FILE = "test_data/opm_format/FLOOD_03/timeseries.csv"
+PRECIP_GAUGE_FILE      = "test_data/opm_format/202409_202409/gauges.csv"
+PRECIP_TIMESERIES_FILE = "test_data/opm_format/202409_202409/timeseries.csv"
 PRECIP_IDW_POWER       = 2.0        # IDW distance exponent (p=2 is standard)
 
 # ── Runoff generation engine ─────────────────────────────────────────────────
@@ -82,27 +82,69 @@ RUNOFF_CN_PATH          = "runoff/curve_number.tif"
 RUNOFF_SCS_Ia_FACTOR    = 0.2       # SCS initial abstraction ratio (standard 0.2)
 
 # ── OPM / VSA parameters (used when RUNOFF_SOURCE = 'vsa_opm') ──────────────
-# OPM_SD_MAX_INITIAL: initial unsaturated-zone storage capacity at the
-#   catchment divide [m].  Represents max soil moisture deficit from field
-#   capacity.  Typical range: 0.05–0.10 m (shallow soils) to 0.20–0.30 m
-#   (deep forest soils).
-OPM_SD_MAX_INITIAL = 0.10    # m
+# OPM_SD_MAX_INITIAL: root zone depth D — vertical height of the soil column
+#   at the catchment divide [m].  Equals SD_max when soil is at field capacity
+#   (z=0).  When OPM_SD_SOURCE='gee', overridden by SERVES-derived max deficit.
+OPM_SD_MAX_INITIAL = 0.1    # m  (physical height, not water volume)
 
 # OPM_Q_MAX: observed baseflow / initial discharge at the outlet [m³/s].
 #   Used in Eq 10 (Pradhan & Ogden 2010) to calibrate the initial threshold
 #   area A_t.  Must be > 0.001 m³/s (the model's Q_min constant).
 OPM_Q_MAX          = 0.50    # m³/s  — set to observed pre-storm discharge
 
-# OPM_PHI: drainable porosity (specific yield) of the soil [-].
-#   Relates volume change of groundwater to saturated-zone thickness change.
-#   Typical values: sandy soils 0.25–0.35; loamy soils 0.15–0.25; clay 0.05–0.15.
+# OPM_PHI: drainable porosity [-] (≈ porosity − field capacity).
+#   Converts water volume to saturated zone height change: dz = dV/(A×φ).
+#   When OPM_SD_SOURCE='gee', overridden by SoilGrids-derived mean.
+#   Typical values: 0.05–0.15 (fine soils) to 0.20–0.35 (coarse soils).
 OPM_PHI            = 0.35    # dimensionless
 
 # OPM_K_SAT: saturated hydraulic conductivity of the soil [m/day].
 #   Used in Darcy lateral drainage at the catchment divide (sandbox water
-#   balance, Eq 12).  Assumed uniform over the catchment.
+#   balance, Eq 12).  Used when OPM_KSAT_SOURCE='manual'.
 #   Typical values: clay 0.01–0.1; loam 0.1–1; sandy loam 1–10; sand 10–100.
 OPM_K_SAT          = 44.0   # m/day  (≈ sandy loam / gravelly soil)
+
+# OPM_KSAT_SOURCE: how K_sat is determined
+#   'manual' → use OPM_K_SAT above (single value for entire catchment)
+#   'gee'    → HiHydroSoil v2.0 via GEE (250m global)
+#              When OPM_PER_POLYGON=True: per-polygon mean K_sat
+#              When OPM_PER_POLYGON=False: watershed mean K_sat
+#              Falls back to OPM_K_SAT if GEE query fails.
+OPM_KSAT_SOURCE    = 'gee'
+
+# OPM_PER_POLYGON: when True and PRECIP_METHOD is 'thiessen'/'idw', each
+#   gauge zone gets its own sandbox (z, SD_max, H_a, A_t, K_sat).
+#   When False, a single sandbox (divide cell with min faccum) is used
+#   even with spatially variable precipitation.
+OPM_PER_POLYGON    = True
+
+# ── GEE / SERVES integration (optional) ─────────────────────────────────
+# OPM_SD_SOURCE: how SD_max_initial and φ are determined
+#   'manual' → use OPM_SD_MAX_INITIAL and OPM_PHI above (default)
+#   'gee'    → SERVES deficit + LULC root zone depth + SoilGrids porosity
+#              SD_max = max((porosity − θ_SERVES) × Z_r)
+#              φ      = mean(porosity − FC)
+#              Requires: pip install earthengine-api
+OPM_SD_SOURCE          = 'gee'
+
+# LULC lookup CSV: ESA WorldCover class → root zone depth, Manning's n
+LULC_LOOKUP_CSV        = 'lulc_lookup.csv'
+
+# SERVES target date for NDVI query (match simulation start for antecedent conditions)
+SERVES_TARGET_DATE     = None            # None → must be set (or auto-set by run_all_floods.py)
+SERVES_SATELLITE       = 'landsat'      # 'landsat' | 'sentinel2' | 'modis'
+SERVES_SEARCH_WINDOW   = 16             # days ± around target date
+
+# SoilGrids depth band: 'b0' (0-5cm), 'b10' (5-15cm), 'b30' (15-30cm),
+#   'b60' (30-60cm), 'b100' (60-100cm), 'b200' (100-200cm)
+OPM_SOILGRIDS_DEPTH    = 'b30'     # 15–30 cm
+
+# Watershed boundary for GEE query (auto-generated by process_dem.py)
+OPM_WATERSHED_GEOJSON  = 'output/watershed.geojson'
+
+# Google Earth Engine cloud project ID (required for GEE API).
+# Also settable via GEE_PROJECT environment variable.
+GEE_PROJECT            = 'ee-sauravbhattarai1999'
 
 # --- Numerical stability / physical limits ---
 # Minimum slope used in Manning's equation to avoid division-by-zero.

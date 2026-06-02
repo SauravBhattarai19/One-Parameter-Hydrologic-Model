@@ -1,0 +1,20 @@
+# OPM — One-Parameter Model for Variable Source Area Runoff
+# Core scientific
+numpy
+pandas
+scipy
+matplotlib
+
+# Geospatial
+rasterio
+geopandas
+shapely
+pyproj
+pysheds
+fiona
+
+# Optional: GPU acceleration (requires CUDA)
+# cupy-cuda12x
+
+# Optional: dynamic SD_max from SoilGrids (requires GEE auth)
+# earthengine-api

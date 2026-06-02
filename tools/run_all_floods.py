@@ -1,25 +1,22 @@
 """
 run_all_floods.py
 =================
-End-to-end CPU vs GPU benchmark pipeline for every FLOOD event.
+End-to-end GPU routing pipeline for every FLOOD event.
 
 Stages timed
 ------------
   [0] process_dem     – reproject / fill / flow-dir / accumulation / watershed
-                        (CPU-only via pysheds; runs once, shared by both backends)
+                        (CPU-only via pysheds; runs once)
   [1] GAG → OPM       – convert .gag rainfall files to OPM CSVs   (CPU-only)
-  [2a] CPU init       – initialise_grid (BACKEND='cpu')
-  [2b] CPU loop       – run_time_loop   (BACKEND='cpu')
-  [3a] GPU init       – initialise_grid (BACKEND='gpu')
-  [3b] GPU loop       – run_time_loop   (BACKEND='gpu')
+  [2a] GPU init       – initialise_grid (BACKEND='gpu')
+  [2b] GPU loop       – run_time_loop   (BACKEND='gpu')
 
 Output
 ------
-  output/hydrograph_<EVENT>_cpu.csv
-  output/hydrograph_<EVENT>_gpu.csv
-  output/comparison_<EVENT>.png          (CPU hydrograph vs observed)
-  output/timing_benchmark.csv            (machine-readable timing table)
-  Console: coloured timing table + speedup ratios + peak-Q comparison
+  output/hydrograph_<EVENT>.csv
+  output/comparison_<EVENT>.png
+  output/summary_all_floods.csv
+  Console: timing table + peak-Q stats
 
 Usage
 -----
@@ -31,7 +28,6 @@ import re
 import csv
 import sys
 import time
-import importlib
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -71,23 +67,11 @@ def hms(seconds: float) -> str:
         return f"{seconds:.2f}s"
 
 
-def speedup_str(cpu: float, gpu: float) -> str:
-    if gpu <= 0:
-        return "  —  "
-    ratio = cpu / gpu
-    return f"{ratio:5.1f}×"
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Stage 0 — process_dem  (CPU only, run once)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_process_dem() -> float:
-    """
-    Run process_dem.main() and return wall-clock seconds.
-    Produces: output/clipped_dem.tif, flow_direction.tif,
-              clipped_flow_accumulation.tif, watershed.tif
-    """
     import process_dem
     t0 = time.perf_counter()
     process_dem.main()
@@ -145,17 +129,13 @@ def gag_sim_hours(data: dict) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 2/3 — Router  (CPU or GPU)
+# Stage 2 — Router (GPU)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_router(gauge_csv: Path, ts_csv: Path, sim_hours: float,
-               backend: str) -> tuple:
+               event_start_date: str = None) -> tuple:
     """
-    Run the kinematic-wave router for one event on the given backend.
-
-    Parameters
-    ----------
-    backend : 'cpu' or 'gpu'
+    Run the kinematic-wave router for one event on GPU.
 
     Returns
     -------
@@ -166,11 +146,12 @@ def run_router(gauge_csv: Path, ts_csv: Path, sim_hours: float,
     import config
     import kinematic_wave_router as kwr
 
-    # Override per-event and per-backend settings
     config.PRECIP_GAUGE_FILE           = str(gauge_csv.relative_to(REPO_ROOT))
     config.PRECIP_TIMESERIES_FILE      = str(ts_csv.relative_to(REPO_ROOT))
     config.TOTAL_SIMULATION_TIME_HOURS = sim_hours
-    config.BACKEND                     = backend
+    config.BACKEND                     = 'gpu'
+    if hasattr(config, 'SERVES_TARGET_DATE'):
+        config.SERVES_TARGET_DATE      = event_start_date
 
     t0 = time.perf_counter()
     grid_data = kwr.initialise_grid(config)
@@ -223,18 +204,14 @@ def compute_metrics(otl: pd.DataFrame, hydrograph: list) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def make_plot(event_name: str, event_start: datetime,
-              otl: pd.DataFrame,
-              hyd_cpu: list, hyd_gpu: list,
+              otl: pd.DataFrame, hydrograph: list,
               ts_csv: Path, metrics: dict, out_png: Path) -> None:
 
-    mod_s_cpu = np.array([h[0] for h in hyd_cpu], dtype=float)
-    mod_Q_cpu = np.array([h[1] for h in hyd_cpu], dtype=float)
-    mod_s_gpu = np.array([h[0] for h in hyd_gpu], dtype=float)
-    mod_Q_gpu = np.array([h[1] for h in hyd_gpu], dtype=float)
+    mod_s = np.array([h[0] for h in hydrograph], dtype=float)
+    mod_Q = np.array([h[1] for h in hydrograph], dtype=float)
 
-    obs_dt    = [event_start + timedelta(minutes=float(m)) for m in otl["time_min"]]
-    mod_dt_cpu = [event_start + timedelta(seconds=float(s)) for s in mod_s_cpu]
-    mod_dt_gpu = [event_start + timedelta(seconds=float(s)) for s in mod_s_gpu]
+    obs_dt = [event_start + timedelta(minutes=float(m)) for m in otl["time_min"]]
+    mod_dt = [event_start + timedelta(seconds=float(s)) for s in mod_s]
 
     obs_peak_dt = event_start + timedelta(seconds=metrics["obs_peak_s"])
     mod_peak_dt = event_start + timedelta(seconds=metrics["mod_peak_s"])
@@ -247,11 +224,9 @@ def make_plot(event_name: str, event_start: datetime,
 
     ax.plot(obs_dt, otl["Q_m3s"], color="black", lw=1.8,
             label="Observed (GSSHA)", zorder=4)
-    ax.plot(mod_dt_cpu, mod_Q_cpu, color="#1f6aa5", lw=1.8, ls="--",
-            label="VSA-OPM CPU", zorder=3)
-    ax.plot(mod_dt_gpu, mod_Q_gpu, color="#e07b00", lw=1.2, ls=":",
-            label="VSA-OPM GPU", zorder=2)
-    ax.fill_between(mod_dt_cpu, mod_Q_cpu, alpha=0.10, color="#1f6aa5")
+    ax.plot(mod_dt, mod_Q, color="#1f6aa5", lw=1.8, ls="--",
+            label="VSA-OPM (GPU)", zorder=3)
+    ax.fill_between(mod_dt, mod_Q, alpha=0.10, color="#1f6aa5")
 
     ax.annotate(
         f"Obs peak\n{metrics['obs_peak_Q']:.0f} m³/s\n{obs_peak_dt.strftime('%b %d %H:%M')}",
@@ -300,8 +275,8 @@ def make_plot(event_name: str, event_start: datetime,
     fig.autofmt_xdate()
     ax_rain.set_xlabel(f"Date ({event_start.year})", fontsize=11)
 
-    t_min = min(obs_dt[0], mod_dt_cpu[0])
-    t_max = max(obs_dt[-1], mod_dt_cpu[-1])
+    t_min = min(obs_dt[0], mod_dt[0])
+    t_max = max(obs_dt[-1], mod_dt[-1])
     ax.set_xlim(t_min, t_max)
 
     plt.tight_layout()
@@ -314,73 +289,29 @@ def make_plot(event_name: str, event_start: datetime,
 # Timing table printers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_event_timing(event_name: str,
-                       t_gag: float,
-                       cpu_init: float, cpu_loop: float,
-                       gpu_init: float, gpu_loop: float,
-                       q_max_diff: float) -> None:
-    """Print a per-event timing breakdown."""
-    cpu_total = cpu_init + cpu_loop
-    gpu_total = gpu_init + gpu_loop
-
-    W = 68
-    print("\n" + "─" * W)
-    print(f"  TIMING  │  {event_name}")
-    print("─" * W)
-    print(f"  {'Stage':<28}  {'CPU':>10}  {'GPU':>10}  {'Speedup':>8}")
-    print("  " + "─" * (W - 2))
-    print(f"  {'GAG → OPM conversion':<28}  {hms(t_gag):>10}  {'(shared)':>10}  {'  —':>8}")
-    print(f"  {'initialise_grid':<28}  {hms(cpu_init):>10}  {hms(gpu_init):>10}  {speedup_str(cpu_init, gpu_init):>8}")
-    print(f"  {'run_time_loop':<28}  {hms(cpu_loop):>10}  {hms(gpu_loop):>10}  {speedup_str(cpu_loop, gpu_loop):>8}")
-    print("  " + "─" * (W - 2))
-    print(f"  {'TOTAL (routing)':<28}  {hms(cpu_total):>10}  {hms(gpu_total):>10}  {speedup_str(cpu_total, gpu_total):>8}")
-    print(f"\n  CPU/GPU peak-Q diff : {q_max_diff:.6f} m³/s  "
-          f"({'PASS ✓' if q_max_diff < 1e-3 else 'DIFF !'} vs 1e-3 threshold)")
-    print("─" * W)
-
-
 def print_summary_table(t_dem: float, rows: list) -> None:
-    """
-    rows : list of dicts with keys
-           event, sim_h, cpu_init, cpu_loop, gpu_init, gpu_loop
-    """
-    W = 88
+    W = 70
     print("\n" + "═" * W)
-    print("  BENCHMARK SUMMARY")
+    print("  BENCHMARK SUMMARY  (GPU)")
     print("═" * W)
-    print(f"  {'Event':<18}  {'Sim':>5}  "
-          f"{'CPU init':>9}  {'CPU loop':>9}  {'CPU total':>9}  "
-          f"{'GPU init':>9}  {'GPU loop':>9}  {'GPU total':>9}  "
-          f"{'Speedup':>8}")
+    print(f"  {'Event':<18}  {'Sim':>5}  {'Init':>9}  {'Loop':>9}  {'Total':>9}")
     print("  " + "─" * (W - 2))
 
-    total_cpu_init = total_cpu_loop = 0.0
-    total_gpu_init = total_gpu_loop = 0.0
-
+    total_init = total_loop = 0.0
     for r in rows:
-        cpu_total = r["cpu_init"] + r["cpu_loop"]
-        gpu_total = r["gpu_init"] + r["gpu_loop"]
-        total_cpu_init += r["cpu_init"]
-        total_cpu_loop += r["cpu_loop"]
-        total_gpu_init += r["gpu_init"]
-        total_gpu_loop += r["gpu_loop"]
+        total_init += r["t_init"]
+        total_loop += r["t_loop"]
+        total = r["t_init"] + r["t_loop"]
         print(f"  {r['event']:<18}  {r['sim_h']:>4.0f}h  "
-              f"  {hms(r['cpu_init']):>9}  {hms(r['cpu_loop']):>9}  {hms(cpu_total):>9}  "
-              f"  {hms(r['gpu_init']):>9}  {hms(r['gpu_loop']):>9}  {hms(gpu_total):>9}  "
-              f"  {speedup_str(cpu_total, gpu_total):>8}")
+              f"  {hms(r['t_init']):>9}  {hms(r['t_loop']):>9}  {hms(total):>9}")
 
-    total_cpu = total_cpu_init + total_cpu_loop
-    total_gpu = total_gpu_init + total_gpu_loop
+    total = total_init + total_loop
     print("  " + "─" * (W - 2))
     print(f"  {'ALL EVENTS':<18}  {'':>5}  "
-          f"  {hms(total_cpu_init):>9}  {hms(total_cpu_loop):>9}  {hms(total_cpu):>9}  "
-          f"  {hms(total_gpu_init):>9}  {hms(total_gpu_loop):>9}  {hms(total_gpu):>9}  "
-          f"  {speedup_str(total_cpu, total_gpu):>8}")
+          f"  {hms(total_init):>9}  {hms(total_loop):>9}  {hms(total):>9}")
     print()
-    print(f"  process_dem (CPU only, one-time)  :  {hms(t_dem)}")
-    print(f"  Total wall time  CPU (dem+routing):  {hms(t_dem + total_cpu)}")
-    print(f"  Total wall time  GPU (dem+routing):  {hms(t_dem + total_gpu)}")
-    print(f"  End-to-end speedup (routing only) :  {speedup_str(total_cpu, total_gpu)}")
+    print(f"  process_dem (one-time)           :  {hms(t_dem)}")
+    print(f"  Total wall time (dem + routing)  :  {hms(t_dem + total)}")
     print("═" * W)
 
 
@@ -398,13 +329,13 @@ def main():
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    has_gpu = gpu_utils.cupy_available()
-    if not has_gpu:
-        print("[WARNING] CuPy not available — GPU runs will be skipped.")
-    else:
-        import cupy as cp
-        mem = cp.cuda.Device(0).mem_info
-        print(f"GPU detected: {mem[1]/1e9:.1f} GB VRAM  ({mem[0]/1e9:.1f} GB free)")
+    if not gpu_utils.cupy_available():
+        print("[ERROR] CuPy not available — this script requires a GPU.")
+        sys.exit(1)
+
+    import cupy as cp
+    mem = cp.cuda.Device(0).mem_info
+    print(f"GPU detected: {mem[1]/1e9:.1f} GB VRAM  ({mem[0]/1e9:.1f} GB free)")
 
     # ── Stage 0: process_dem ─────────────────────────────────────────────────
     print("\n" + "=" * 68)
@@ -441,78 +372,45 @@ def main():
         gauge_csv = opm_dir / "gauges.csv"
         ts_csv    = opm_dir / "timeseries.csv"
 
-        # ── Stage 2: CPU run ──────────────────────────────────────────────────
-        print(f"\n[2] CPU routing  (BACKEND='cpu')")
-        hyd_cpu, cpu_init, cpu_loop = run_router(
-            gauge_csv, ts_csv, sim_hours, backend='cpu'
+        # ── Stage 2: GPU routing ──────────────────────────────────────────────
+        print(f"\n[2] GPU routing  (BACKEND='gpu')")
+        hydrograph, t_init, t_loop = run_router(
+            gauge_csv, ts_csv, sim_hours,
+            event_start_date=event_start.strftime('%Y-%m-%d'),
         )
-        print(f"    init={hms(cpu_init)}  loop={hms(cpu_loop)}  "
-              f"total={hms(cpu_init+cpu_loop)}")
+        print(f"    init={hms(t_init)}  loop={hms(t_loop)}  "
+              f"total={hms(t_init + t_loop)}")
 
-        # Save CPU hydrograph
-        hyd_csv_cpu = OUTPUT_DIR / f"hydrograph_{event_name}_cpu.csv"
+        # Save hydrograph
+        hyd_csv = OUTPUT_DIR / f"hydrograph_{event_name}.csv"
         pd.DataFrame({
-            "time_s":  [h[0] for h in hyd_cpu],
-            "time_hr": [h[0] / 3600 for h in hyd_cpu],
-            "Q_m3s":   [h[1] for h in hyd_cpu],
-        }).to_csv(hyd_csv_cpu, index=False)
-
-        # ── Stage 3: GPU run ──────────────────────────────────────────────────
-        if has_gpu:
-            print(f"\n[3] GPU routing  (BACKEND='gpu')")
-            hyd_gpu, gpu_init, gpu_loop = run_router(
-                gauge_csv, ts_csv, sim_hours, backend='gpu'
-            )
-            print(f"    init={hms(gpu_init)}  loop={hms(gpu_loop)}  "
-                  f"total={hms(gpu_init+gpu_loop)}")
-
-            # Save GPU hydrograph
-            hyd_csv_gpu = OUTPUT_DIR / f"hydrograph_{event_name}_gpu.csv"
-            pd.DataFrame({
-                "time_s":  [h[0] for h in hyd_gpu],
-                "time_hr": [h[0] / 3600 for h in hyd_gpu],
-                "Q_m3s":   [h[1] for h in hyd_gpu],
-            }).to_csv(hyd_csv_gpu, index=False)
-
-            # Correctness check: max Q difference between CPU and GPU
-            cpu_Q = np.array([h[1] for h in hyd_cpu])
-            gpu_Q = np.array([h[1] for h in hyd_gpu])
-            q_max_diff = float(np.max(np.abs(cpu_Q - gpu_Q)))
-        else:
-            hyd_gpu   = hyd_cpu   # fallback: same data
-            gpu_init  = gpu_loop = 0.0
-            q_max_diff = 0.0
-
-        # ── Per-event timing table ────────────────────────────────────────────
-        print_event_timing(event_name, t_gag,
-                           cpu_init, cpu_loop,
-                           gpu_init, gpu_loop,
-                           q_max_diff)
+            "time_s":  [h[0] for h in hydrograph],
+            "time_hr": [h[0] / 3600 for h in hydrograph],
+            "Q_m3s":   [h[1] for h in hydrograph],
+        }).to_csv(hyd_csv, index=False)
+        print(f"    Hydrograph saved → {hyd_csv.relative_to(REPO_ROOT)}")
 
         summary_rows.append({
-            "event":    event_name,
-            "sim_h":    sim_hours,
-            "cpu_init": cpu_init,
-            "cpu_loop": cpu_loop,
-            "gpu_init": gpu_init,
-            "gpu_loop": gpu_loop,
+            "event":  event_name,
+            "sim_h":  sim_hours,
+            "t_init": t_init,
+            "t_loop": t_loop,
         })
 
-        # ── Stage 4: Observed data + metrics ─────────────────────────────────
+        # ── Stage 3: Observed data + metrics ─────────────────────────────────
         if not disc_path.exists():
             print(f"\n  [WARN] {disc_path.name} not found — skipping plot.")
             continue
 
-        print(f"\n[4] Metrics & plot")
+        print(f"\n[3] Metrics & plot")
         otl     = load_discharge_csv(disc_path, event_start)
-        metrics = compute_metrics(otl, hyd_cpu)   # use CPU result as reference
+        metrics = compute_metrics(otl, hydrograph)
         print(f"    NSE={metrics['nse']:.3f}  PBIAS={metrics['pbias']:.1f}%  "
               f"Obs Qp={metrics['obs_peak_Q']:.1f} m³/s  "
               f"Mod Qp={metrics['mod_peak_Q']:.1f} m³/s")
 
         out_png = OUTPUT_DIR / f"comparison_{event_name}.png"
-        make_plot(event_name, event_start, otl, hyd_cpu, hyd_gpu,
-                  ts_csv, metrics, out_png)
+        make_plot(event_name, event_start, otl, hydrograph, ts_csv, metrics, out_png)
 
         all_metrics.append({
             "event":       event_name,
@@ -529,28 +427,16 @@ def main():
     print_summary_table(t_dem, summary_rows)
 
     # Save timing CSV
-    timing_csv = OUTPUT_DIR / "timing_benchmark.csv"
-    timing_rows = []
-    for r in summary_rows:
-        cpu_total = r["cpu_init"] + r["cpu_loop"]
-        gpu_total = r["gpu_init"] + r["gpu_loop"]
-        timing_rows.append({
-            "event":        r["event"],
-            "sim_hours":    r["sim_h"],
-            "cpu_init_s":   round(r["cpu_init"], 2),
-            "cpu_loop_s":   round(r["cpu_loop"], 2),
-            "cpu_total_s":  round(cpu_total, 2),
-            "gpu_init_s":   round(r["gpu_init"], 2),
-            "gpu_loop_s":   round(r["gpu_loop"], 2),
-            "gpu_total_s":  round(gpu_total, 2),
-            "speedup_init": round(r["cpu_init"] / r["gpu_init"], 2) if r["gpu_init"] > 0 else None,
-            "speedup_loop": round(r["cpu_loop"] / r["gpu_loop"], 2) if r["gpu_loop"] > 0 else None,
-            "speedup_total":round(cpu_total / gpu_total, 2) if gpu_total > 0 else None,
-        })
-    pd.DataFrame(timing_rows).to_csv(timing_csv, index=False)
+    timing_csv = OUTPUT_DIR / "timing_gpu.csv"
+    pd.DataFrame([{
+        "event":       r["event"],
+        "sim_hours":   r["sim_h"],
+        "init_s":      round(r["t_init"], 2),
+        "loop_s":      round(r["t_loop"], 2),
+        "total_s":     round(r["t_init"] + r["t_loop"], 2),
+    } for r in summary_rows]).to_csv(timing_csv, index=False)
     print(f"\n  Timing CSV saved → {timing_csv.relative_to(REPO_ROOT)}")
 
-    # Save performance metrics CSV
     if all_metrics:
         metrics_csv = OUTPUT_DIR / "summary_all_floods.csv"
         pd.DataFrame(all_metrics).to_csv(metrics_csv, index=False)

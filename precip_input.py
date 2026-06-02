@@ -36,13 +36,16 @@ def _build_thiessen_weights(cell_coords, gauge_coords):
     """
     Nearest-neighbour (Voronoi / Thiessen) weights.
 
-    Returns (n_cells, n_gauges) 0/1 matrix — each row has exactly one 1.
+    Returns
+    -------
+    W       : (n_cells, n_gauges) 0/1 matrix — each row has exactly one 1.
+    nearest : (n_cells,) int array — index of nearest gauge per cell.
     """
     from scipy.spatial import KDTree
     _, nearest = KDTree(gauge_coords).query(cell_coords, k=1)
     W = np.zeros((len(cell_coords), len(gauge_coords)), dtype=np.float64)
     W[np.arange(len(cell_coords)), nearest] = 1.0
-    return W
+    return W, nearest
 
 
 def _build_idw_weights(cell_coords, gauge_coords, power=2.0):
@@ -124,6 +127,7 @@ class PrecipEngine:
                                    [0.0]])        # shape (3, 1)
         self._weights  = np.ones((self._n_cells, 1), dtype=np.float64)
         self._n_gauges = 1
+        self._cell_polygon = None   # no zones for uniform rainfall
 
     def _init_gauge(self, cfg, grid_data):
         """
@@ -177,9 +181,12 @@ class PrecipEngine:
 
         power = getattr(cfg, 'PRECIP_IDW_POWER', 2.0)
         if self._method == 'thiessen':
-            self._weights = _build_thiessen_weights(cell_xy, gauge_xy)
+            self._weights, self._cell_polygon = _build_thiessen_weights(cell_xy, gauge_xy)
         else:
             self._weights = _build_idw_weights(cell_xy, gauge_xy, power)
+            # For IDW: zone cells by nearest gauge for per-polygon VSA sandbox
+            from scipy.spatial import KDTree
+            _, self._cell_polygon = KDTree(gauge_xy).query(cell_xy, k=1)
 
         # Sanity check: rows should sum to ~1
         row_sums = self._weights.sum(axis=1)
@@ -237,6 +244,11 @@ class PrecipEngine:
     def is_raining(self, t_seconds):
         """True if any active cell receives non-zero rain at *t_seconds*."""
         return bool(self.get_field_1d(t_seconds).max() > 0.0)
+
+    @property
+    def cell_polygon(self):
+        """Per-cell nearest-gauge zone index (n_cells,) int, or None for uniform."""
+        return self._cell_polygon
 
     @property
     def rain_end_seconds(self):

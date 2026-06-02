@@ -140,6 +140,9 @@ def initialise_grid(cfg):
     print("  Building precipitation engine...")
     grid_data["precip_engine"] = _PrecipEngine(cfg, grid_data)
 
+    # Expose per-cell zone assignment for per-polygon VSA sandbox
+    grid_data["cell_polygon"] = grid_data["precip_engine"].cell_polygon
+
     # Build runoff generation engine (optional; None when RUNOFF_SOURCE='none')
     _rsrc = getattr(cfg, 'RUNOFF_SOURCE', 'none').lower()
     if _rsrc != 'none':

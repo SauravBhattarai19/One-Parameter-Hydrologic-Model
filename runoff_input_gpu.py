@@ -29,6 +29,8 @@ _update_scs_cn   – replace np.maximum / np.zeros  with cp equivalents
 get_effective_2d – GPU → CPU transfer before the 2-D write-back
 """
 
+import math
+
 import numpy as np
 import cupy as cp
 
@@ -75,8 +77,13 @@ class RunoffEngineGPU(RunoffEngine):
                 for t, arr in self._raster_cache.items()
             }
 
-        # 'vsa_opm': _upslope_area and _vsa_mask are already CuPy (built from
-        #             the CuPy faccum_1d / slope_1d in grid_data).
+        elif mode == 'vsa_opm':
+            # _upslope_area and _vsa_mask are already CuPy (built from CuPy
+            # faccum_1d in grid_data).  Per-polygon mode needs cell_polygon
+            # on GPU for vectorised mask rebuild.
+            if getattr(self, '_per_polygon', False):
+                self._cell_polygon = cp.asarray(self._cell_polygon)
+
         # 'none': stateless, nothing to do.
 
     # ── Overrides for SCS-CN (require cp.* ops) ───────────────────────────────
@@ -98,6 +105,44 @@ class RunoffEngineGPU(RunoffEngine):
         self._scs_rate_ms = (delta / 1000.0) / dt if dt > 0 \
             else cp.zeros(self._n_cells, dtype=np.float64)  # [m/s]
         self._Pe_mm_old = Pe_new
+
+    # ── Per-polygon sandbox override (GPU) ──────────────────────────────────
+
+    def _update_opm_sandbox_per_polygon(self, rain_1d, dt):
+        """
+        Per-polygon sandbox update — GPU version.
+
+        The per-polygon loop is tiny (n_gauges iterations) so it runs with
+        scalar Python math.  rain_1d is a CuPy array; we extract scalars
+        via .item().  After the loop, sync A_t to GPU and rebuild the mask.
+        """
+        for p in range(self._n_polygons):
+            P_div = float(rain_1d[self._polygon_divide_idx[p]].item())
+
+            z_p = self._opm_z[p]
+            q_b = self._ksat_ms[p] * self._polygon_slope_divide[p] * z_p * self._cell_size
+            dV  = (P_div * self._cell_area - q_b) * dt
+            dz  = dV / (self._cell_area * self._phi)
+            z_p = max(0.0, z_p + dz)
+            self._opm_z[p] = z_p
+
+            SD_max_p = max(self._sd_min, self._SD_max_initial[p] - z_p)
+            self._opm_SD_max[p] = SD_max_p
+
+            Rf_t  = self._sd_min / SD_max_p
+            H_a_p = self._opm_H_a[p]
+            denom = H_a_p - math.log(Rf_t)
+            if abs(denom) < 1e-12:
+                self._opm_A_t[p] = self._opm_A_t_init
+            else:
+                new_A_t = H_a_p * self._opm_A_1 / denom
+                self._opm_A_t[p] = max(self._opm_A_1,
+                                       min(new_A_t, self._opm_A_outlet))
+
+        # Sync updated A_t to GPU and rebuild VSA mask
+        A_t_gpu        = cp.asarray(self._opm_A_t)
+        A_t_per_cell   = A_t_gpu[self._cell_polygon]
+        self._vsa_mask = self._upslope_area > A_t_per_cell
 
     # ── 2-D output override (GPU → CPU) ──────────────────────────────────────
 
