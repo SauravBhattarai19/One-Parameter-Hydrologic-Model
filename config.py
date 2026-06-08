@@ -1,8 +1,28 @@
 # config.py
+# =============================================================================
+# Configuration for the VSA / OPM distributed hydrologic model.
+# Values only — no logic.  Changing OUTPUT_DIR (§1) cascades to every path
+# derived from it.
+#
+# Contents
+#   1.  Event & scenario          ← DEM, output folder, event timing, GEE
+#   2.  Watershed pre-processing outputs (process_dem.py)
+#   3.  Precipitation
+#   4.  Runoff generation
+#   5.  OPM / VSA parameters
+#   6.  SERVES / GEE soil-moisture deficit (SD_max & phi)
+#   7.  Manning's roughness
+#   8.  Grid & numerical limits
+#   9.  Outputs
+#   10. Compute backend
+# =============================================================================
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRE-PROCESSING  (existing)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1.  EVENT & SCENARIO
+# ═════════════════════════════════════════════════════════════════════════════
+# Change these five knobs to define a new event/scenario.  Everything else
+# (IMERG window, SERVES date, derived paths) flows from them automatically.
 
 # Path to the Digital Elevation Model (DEM) file
 DEM_PATH = "./dem_100m.tif"
@@ -13,61 +33,96 @@ TARGET_CRS_EPSG = "EPSG:32645"
 # Output point for watershed delineation (latitude, longitude)
 OUTPUT_POINT = (27.632222, 85.293333)  # (lat, lon)
 
-# Output directory for all generated files
-OUTPUT_DIR = "output/"
+# Output directory for all generated files.  This is the ONE knob that defines a
+# scenario — every derived path below (rasters, IMERG data, deficit raster,
+# hydrograph) hangs off it, so changing it here moves the whole scenario.
+OUTPUT_DIR = "outputs collection/multiple_imerg/"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KINEMATIC WAVE ROUTING  (new)
-# ─────────────────────────────────────────────────────────────────────────────
+# EVENT_START_UTC: event / simulation start in UTC ("YYYY-MM-DD HH:MM").
+#   Single source of truth for the event date, used by:
+#     • SERVES antecedent query  — date portion is the antecedent moisture date
+#     • IMERG download window    — start = EVENT_START_UTC + IMERG_UTC_OFFSET_HOURS
+#                                  end   = start + TOTAL_SIMULATION_TIME_HOURS
+#   None → fallback to IMERG_START_LOCAL / IMERG_END_LOCAL if set (backward compat).
+EVENT_START_UTC = None
 
-# --- Input raster paths (outputs from process_dem.py) ---
-ROUTING_DEM_PATH            = "output/clipped_dem.tif"
-ROUTING_FLOW_DIR_PATH       = "output/flow_direction.tif"
-ROUTING_FLOW_ACCUM_PATH     = "output/clipped_flow_accumulation.tif"
-ROUTING_WATERSHED_MASK_PATH = "output/watershed.tif"
+# Total simulation length in hours.
+#   Also defines the IMERG download window end when EVENT_START_UTC is set.
+TOTAL_SIMULATION_TIME_HOURS = 96
 
-# --- Grid geometry ---
-# Pixel size of the routing rasters in metres.
-# None  → auto-detected from ROUTING_DEM_PATH at run-time (recommended).
-# Set a float to override (e.g. if you want to document the exact value).
-CELL_SIZE = None
+# UTC offset for display and IMERG local-time conversion.
+#   Nepal Standard Time (NPT) = UTC + 5:45 → 5.75
+#   Set to 0.0 if you work in UTC throughout.
+IMERG_UTC_OFFSET_HOURS = 5.75
 
-# --- Manning's roughness ---
-# Representative n for the overland/channel surface.
-# Typical values: 0.04–0.10 for natural channels / hillslopes.
-MANNINGS_N = 0.09
+# Lookup CSVs: land-cover class → root zone depth, Manning's n.
+LULC_LOOKUP_CSV = 'lulc_lookup.csv'   # ESA WorldCover (used when MANNINGS_N_SOURCE='lulc')
+LCZ_LOOKUP_CSV  = 'lcz_lookup.csv'    # WUDAPT LCZ     (used when MANNINGS_N_SOURCE='lcz')
 
-# --- Time stepping ---
-# Δt must satisfy the Courant criterion: Δt ≤ CELL_SIZE / V_max
-# Start conservatively (e.g., 30–60 s) and decrease if the model goes unstable.
-TIME_STEP_SECONDS = 5           # seconds
+# Google Earth Engine cloud project ID (required for IMERG, SERVES, LULC/LCZ download).
+# Also settable via the GEE_PROJECT environment variable.
+GEE_PROJECT = 'ee-sauravbhattarai1999'
 
-# Total length of the simulation
-TOTAL_SIMULATION_TIME_HOURS = 96   # hours  (202409: 2024-09-26 to 2024-09-30, 15-min gauges)
 
-# --- Output write interval ---
-# How often to record a row in hydrograph.csv (seconds of simulation time).
-# Should be >= TIME_STEP_SECONDS. With small dt (e.g. 5 s) writing every step
-# produces millions of rows — set this to 300 s (5 min) or 3600 s (1 hr).
-# None → write every time step (only sensible for large dt).
-OUTPUT_INTERVAL_SECONDS = 600   # seconds  (5-minute hydrograph output)
+# ═════════════════════════════════════════════════════════════════════════════
+# 2.  WATERSHED PRE-PROCESSING OUTPUTS  (written by process_dem.py)
+# ═════════════════════════════════════════════════════════════════════════════
+# Derived from OUTPUT_DIR so changing the scenario folder in §1 cascades here.
 
-# --- Rainfall input ---
-# Uniform rainfall intensity applied over the whole watershed
+ROUTING_DEM_PATH            = OUTPUT_DIR + "clipped_dem.tif"
+ROUTING_FLOW_DIR_PATH       = OUTPUT_DIR + "flow_direction.tif"
+ROUTING_FLOW_ACCUM_PATH     = OUTPUT_DIR + "clipped_flow_accumulation.tif"
+ROUTING_WATERSHED_MASK_PATH = OUTPUT_DIR + "watershed.tif"
+
+# Watershed boundary vector (auto-generated by process_dem.py).
+OPM_WATERSHED_GEOJSON = OUTPUT_DIR + 'watershed.geojson'
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3.  PRECIPITATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+# --- Uniform event (used when PRECIP_METHOD = 'uniform') ---
 RAIN_INTENSITY_MM_HR = 20.0         # mm / hour
-RAIN_DURATION_HOURS  = 3.0          # hours  (rainfall stops after this; remainder is recession)
+RAIN_DURATION_HOURS  = 3.0          # hours (rainfall stops; remainder is recession)
 
-# --- Modular precipitation ---
-# Method: 'uniform'  → uses RAIN_INTENSITY_MM_HR / RAIN_DURATION_HOURS above
-#          'thiessen' → Voronoi nearest-gauge spatial weighting
-#          'idw'      → Inverse Distance Weighting (exponent = PRECIP_IDW_POWER)
-# When using 'thiessen' or 'idw' the rainfall comes from the CSV files below.
+# --- Method selection ---
+# 'uniform'        → RAIN_INTENSITY_MM_HR / RAIN_DURATION_HOURS above
+# 'thiessen'       → Voronoi nearest-gauge spatial weighting (CSV gauges)
+# 'idw'            → Inverse Distance Weighting (PRECIP_IDW_POWER)
+# 'imerg_thiessen' → NASA GPM IMERG V07 from GEE, Thiessen weighting
+# 'imerg_idw'      → same IMERG source, IDW weighting
 PRECIP_METHOD          = 'thiessen'
-PRECIP_GAUGE_FILE      = "test_data/opm_format/202409_202409/gauges.csv"
-PRECIP_TIMESERIES_FILE = "test_data/opm_format/202409_202409/timeseries.csv"
-PRECIP_IDW_POWER       = 2.0        # IDW distance exponent (p=2 is standard)
+PRECIP_GAUGE_FILE      = "test_data/opm_format/202407_202408/gauges.csv"
+PRECIP_TIMESERIES_FILE = "test_data/opm_format/202407_202408/timeseries.csv"
+PRECIP_IDW_POWER       = 2.0
 
-# ── Runoff generation engine ─────────────────────────────────────────────────
+# PRECIP_EXCLUDE_OUTSIDE_STATIONS: drop gauge centroids that fall outside the watershed.
+#   False (default) → keep all; boundary cells get the nearest outside station.
+#   True  → outside stations excluded; boundary cells fall to nearest inside station.
+PRECIP_EXCLUDE_OUTSIDE_STATIONS = False
+
+# --- IMERG source (used when PRECIP_METHOD = 'imerg_thiessen' / 'imerg_idw') ---
+# Download strategy: one GEE getRegion call per event, each 0.1° pixel → pseudo-gauge.
+#
+# Event window is AUTO-DERIVED from §1:
+#   IMERG_START_LOCAL = EVENT_START_UTC  + IMERG_UTC_OFFSET_HOURS   (local civil time)
+#   IMERG_END_LOCAL   = EVENT_START_UTC  + TOTAL_SIMULATION_TIME_HOURS + IMERG_UTC_OFFSET_HOURS
+#
+# Override: set IMERG_START_LOCAL / IMERG_END_LOCAL explicitly to bypass derivation.
+IMERG_START_LOCAL   = None   # "YYYY-MM-DD HH:MM" local  |  None → auto from §1
+IMERG_END_LOCAL     = None   # "YYYY-MM-DD HH:MM" local  |  None → auto from §1
+
+PRECIP_IMERG_DIR          = OUTPUT_DIR + "imerg/"
+IMERG_DATASET             = "NASA/GPM_L3/IMERG_V07"
+IMERG_BAND                = "precipitation"          # mm/hr (V07 calibrated)
+PRECIP_IMERG_FORCE_DOWNLOAD = False
+IMERG_BBOX_BUFFER_M       = 11132  # ~1 IMERG pixel; keeps edge cells covered
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4.  RUNOFF GENERATION
+# ═════════════════════════════════════════════════════════════════════════════
 # Controls whether a runoff-generation model transforms rainfall into effective
 # runoff before it enters the kinematic-wave router.
 #   'none'        → all rainfall is direct runoff (default, backward compatible)
@@ -81,103 +136,125 @@ RUNOFF_RASTER_MANIFEST  = "runoff/manifest.csv"
 RUNOFF_CN_PATH          = "runoff/curve_number.tif"
 RUNOFF_SCS_Ia_FACTOR    = 0.2       # SCS initial abstraction ratio (standard 0.2)
 
-# ── OPM / VSA parameters (used when RUNOFF_SOURCE = 'vsa_opm') ──────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5.  OPM / VSA PARAMETERS  (used when RUNOFF_SOURCE = 'vsa_opm')
+# ═════════════════════════════════════════════════════════════════════════════
+
 # OPM_SD_MAX_INITIAL: root zone depth D — vertical height of the soil column
-#   at the catchment divide [m].  Equals SD_max when soil is at field capacity
-#   (z=0).  When OPM_SD_SOURCE='gee', overridden by SERVES-derived max deficit.
+#   at the catchment divide [m].  When OPM_SD_SOURCE='gee', overridden by SERVES.
 OPM_SD_MAX_INITIAL = 0.1    # m  (physical height, not water volume)
 
 # OPM_Q_MAX: observed baseflow / initial discharge at the outlet [m³/s].
-#   Used in Eq 10 (Pradhan & Ogden 2010) to calibrate the initial threshold
-#   area A_t.  Must be > 0.001 m³/s (the model's Q_min constant).
-OPM_Q_MAX          = 0.50    # m³/s  — set to observed pre-storm discharge
+#   Used in Eq 10 (Pradhan & Ogden 2010) to calibrate the initial A_t.
+OPM_Q_MAX          = 100    # m³/s  — set to observed pre-storm discharge
 
-# OPM_PHI: drainable porosity [-] (≈ porosity − field capacity).
-#   Converts water volume to saturated zone height change: dz = dV/(A×φ).
-#   When OPM_SD_SOURCE='gee', overridden by SoilGrids-derived mean.
-#   Typical values: 0.05–0.15 (fine soils) to 0.20–0.35 (coarse soils).
-OPM_PHI            = 0.35    # dimensionless
+# OPM_PHI: drainable porosity [-].  When OPM_SD_SOURCE='gee', overridden by SoilGrids.
+OPM_PHI            = 0.35
 
-# OPM_K_SAT: saturated hydraulic conductivity of the soil [m/day].
-#   Used in Darcy lateral drainage at the catchment divide (sandbox water
-#   balance, Eq 12).  Used when OPM_KSAT_SOURCE='manual'.
-#   Typical values: clay 0.01–0.1; loam 0.1–1; sandy loam 1–10; sand 10–100.
-OPM_K_SAT          = 44.0   # m/day  (≈ sandy loam / gravelly soil)
+# OPM_K_SAT: field-scale lateral saturated hydraulic conductivity [m/day].
+OPM_K_SAT          = 44.0   # m/day  (calibrated)
 
-# OPM_KSAT_SOURCE: how K_sat is determined
-#   'manual' → use OPM_K_SAT above (single value for entire catchment)
-#   'gee'    → HiHydroSoil v2.0 via GEE (250m global)
-#              When OPM_PER_POLYGON=True: per-polygon mean K_sat
-#              When OPM_PER_POLYGON=False: watershed mean K_sat
-#              Falls back to OPM_K_SAT if GEE query fails.
-OPM_KSAT_SOURCE    = 'gee'
-
-# OPM_PER_POLYGON: when True and PRECIP_METHOD is 'thiessen'/'idw', each
-#   gauge zone gets its own sandbox (z, SD_max, H_a, A_t, K_sat).
-#   When False, a single sandbox (divide cell with min faccum) is used
-#   even with spatially variable precipitation.
+# OPM_PER_POLYGON: each gauge zone gets its own OPM sandbox (z, SD_max, A_t).
 OPM_PER_POLYGON    = True
 
-# ── GEE / SERVES integration (optional) ─────────────────────────────────
-# OPM_SD_SOURCE: how SD_max_initial and φ are determined
-#   'manual' → use OPM_SD_MAX_INITIAL and OPM_PHI above (default)
-#   'gee'    → SERVES deficit + LULC root zone depth + SoilGrids porosity
-#              SD_max = max((porosity − θ_SERVES) × Z_r)
-#              φ      = mean(porosity − FC)
-#              Requires: pip install earthengine-api
-OPM_SD_SOURCE          = 'gee'
 
-# LULC lookup CSV: ESA WorldCover class → root zone depth, Manning's n
-LULC_LOOKUP_CSV        = 'lulc_lookup.csv'
+# ═════════════════════════════════════════════════════════════════════════════
+# 6.  SERVES / GEE SOIL-MOISTURE DEFICIT  (SD_max & phi from satellite)
+# ═════════════════════════════════════════════════════════════════════════════
 
-# SERVES target date for NDVI query (match simulation start for antecedent conditions)
-SERVES_TARGET_DATE     = None            # None → must be set (or auto-set by run_all_floods.py)
-SERVES_SATELLITE       = 'landsat'      # 'landsat' | 'sentinel2' | 'modis'
-SERVES_SEARCH_WINDOW   = 16             # days ± around target date
+# OPM_SD_SOURCE:
+#   'manual' → use OPM_SD_MAX_INITIAL and OPM_PHI above
+#   'gee'    → SERVES deficit + LULC/LCZ root zone depth + SoilGrids porosity
+OPM_SD_SOURCE  = 'gee'
 
-# SoilGrids depth band: 'b0' (0-5cm), 'b10' (5-15cm), 'b30' (15-30cm),
-#   'b60' (30-60cm), 'b100' (60-100cm), 'b200' (100-200cm)
-OPM_SOILGRIDS_DEPTH    = 'b30'     # 15–30 cm
+# OPM_SD_REDUCER: how to aggregate the per-cell deficit per precipitation zone.
+#   'mean' → representative soil moisture  |  'max' → driest cell (divide proxy)
+OPM_SD_REDUCER = 'mean'
 
-# Watershed boundary for GEE query (auto-generated by process_dem.py)
-OPM_WATERSHED_GEOJSON  = 'output/watershed.geojson'
+# Per-cell deficit raster (date-stamped per event by _resolve_sd_params).
+OPM_DEFICIT_RASTER = None   # None → auto-path: {OUTPUT_DIR}/deficit_serves_{date}.tif
 
-# Google Earth Engine cloud project ID (required for GEE API).
-# Also settable via GEE_PROJECT environment variable.
-GEE_PROJECT            = 'ee-sauravbhattarai1999'
+SERVES_SATELLITE     = 'landsat'   # 'landsat' | 'sentinel2' | 'modis'
+SERVES_SEARCH_WINDOW = 30          # days backward from EVENT_START_UTC
 
-# --- Numerical stability / physical limits ---
-# Minimum slope used in Manning's equation to avoid division-by-zero.
-# At 1e-5, a single flat cell (dx≈94 m) takes ~30 min to drain 1 m of water;
-# a 10-cell flat path = 5 h pooling delay → artificial recession surge at t≈14 h.
-# 1e-4 (10 cm per 1 km) is a defensible physical floor for Himalayan valleys
-# and cuts per-cell drainage time to ~9 min.
-MIN_SLOPE       = 1e-4              # m/m
+# SoilGrids depth band for field capacity / wilting point / porosity.
+OPM_SOILGRIDS_DEPTH = 'b30'        # 'b0' 'b10' 'b30' 'b60' 'b100' 'b200'
 
-# Minimum water depth kept to avoid numerical issues (wet/dry front treatment)
-MIN_DEPTH_M     = 1e-6              # metres
 
-# NOTE: MAX_DEPTH_M (depth ceiling) has been removed from the router.
-# Capping depth before Manning's equation freezes Q_out at a fixed value while
-# volume keeps growing → permanent flat plateau in the hydrograph.
-# The flux limiter (Q_out ≤ volume/dt) is the correct stability mechanism;
-# deeper cells simply produce larger Q_out and drain faster (self-correcting).
-# MAX_DEPTH_M is kept here only for the animation colour-scale display.
-MAX_DEPTH_M     = 10.0             # metres  (display use only)
+# ═════════════════════════════════════════════════════════════════════════════
+# 7.  MANNING'S ROUGHNESS  (kinematic-wave routing)
+# ═════════════════════════════════════════════════════════════════════════════
 
-# --- Output ---
-HYDROGRAPH_CSV  = "output/hydrograph.csv"  # Time-series Q at the outlet
+# MANNINGS_N_SOURCE:
+#   'scalar' → uniform MANNINGS_N
+#   'lulc'   → ESA WorldCover  → LULC_LOOKUP_CSV (§1)
+#   'lcz'    → WUDAPT LCZ      → LCZ_LOOKUP_CSV  (§1); also sets OPM root zone depth
+#   'raster' → pre-computed GeoTIFF
+MANNINGS_N_SOURCE = 'lcz'
 
-# ── Backend selection ─────────────────────────────────────────────────────────
-# 'cpu' → NumPy only (default; always works, no extra dependencies)
-# 'gpu' → CuPy/CUDA acceleration (falls back to CPU with a warning if CuPy is
-#          not installed or no CUDA GPU is found)
-BACKEND = 'cpu'
+MANNINGS_N = 0.09   # uniform fallback / nodata default
 
-# Floating-point precision for GPU state arrays.
-#   'float64' → full double precision; results match CPU bit-for-bit (default)
-#   'float32' → halves GPU memory footprint and memory-bandwidth cost;
-#               introduces ~1e-7 relative error per Manning step — validate
-#               hydrograph output before enabling in production runs.
+# LULC raster path (source='lulc'):  'gee' → download ESA WorldCover from GEE
+MANNINGS_N_LULC_PATH = 'gee'
+
+# Pre-computed Manning's n raster (source='raster')
+MANNINGS_N_RASTER_PATH = None
+
+# Channel roughness override for cells above CHANNEL_FACCUM_THRESHOLD.
+# Float → uniform channel n.  Dict → per Strahler order.  None → disabled.
+MANNINGS_N_CHANNEL = 0.035
+'''
+MANNINGS_N_CHANNEL = {
+    1: 0.10,
+    2: 0.06,
+    3: 0.045,
+    4: 0.035,
+}'''
+
+# None → auto (top 1% of watershed cells)
+CHANNEL_FACCUM_THRESHOLD = None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 8.  GRID & NUMERICAL LIMITS
+# ═════════════════════════════════════════════════════════════════════════════
+
+# None → auto-detected from ROUTING_DEM_PATH at run-time (recommended).
+CELL_SIZE = None
+
+# Δt must satisfy the Courant criterion: Δt ≤ CELL_SIZE / V_max
+TIME_STEP_SECONDS = 1
+
+# How often to record a hydrograph row (seconds of simulation time).
+# None → write every time step.
+OUTPUT_INTERVAL_SECONDS = 600
+
+# Minimum slope (m/m) — floor in Manning's to avoid division-by-zero on flat cells.
+MIN_SLOPE   = 1e-4
+
+# Minimum water depth (m) — wet/dry front numerical floor.
+MIN_DEPTH_M = 1e-6
+
+# MAX_DEPTH_M: display use only (animation colour scale).
+# Depth capping was removed from the router; the flux limiter handles stability.
+MAX_DEPTH_M = 10.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 9.  OUTPUTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+HYDROGRAPH_CSV = OUTPUT_DIR + "hydrograph.csv"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 10. COMPUTE BACKEND
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 'cpu' → NumPy  |  'gpu' → CuPy/CUDA (falls back to CPU with warning if unavailable)
+BACKEND = 'gpu'
+
+# 'float64' → double precision, matches CPU bit-for-bit
+# 'float32' → halves GPU memory; introduces ~1e-7 relative error — validate before use
 GPU_PRECISION = 'float64'
-

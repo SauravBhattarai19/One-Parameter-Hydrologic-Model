@@ -90,8 +90,12 @@ def run_opm(cfg):
     slope_1d  = slope_2d[s_rows, s_cols]
     faccum_1d = faccum[s_rows, s_cols].astype(np.float64)  # cell counts
 
-    # Divide cell: first in topological order (minimum faccum ≈ 1)
-    slope_divide = float(slope_1d[0])
+    # Divide cell: highest elevation among cells with minimum faccum
+    min_fa = faccum_1d.min()
+    candidates = np.where(faccum_1d == min_fa)[0]
+    elev_cand = dem[s_rows[candidates], s_cols[candidates]]
+    divide_cell = candidates[elev_cand.argmax()]
+    slope_divide = float(slope_1d[divide_cell])
 
     # Upslope contributing area per cell [m²]
     upslope_area_1d = faccum_1d * cell_area
@@ -117,7 +121,6 @@ def run_opm(cfg):
     phi             = params['phi']
     sd_max_per_poly = params['sd_max_per_polygon']
     K_MS            = params['ksat_ms']
-    ksat_pp_ms      = params['ksat_per_polygon_ms']
     Q_max = float(cfg.OPM_Q_MAX)
 
     if Q_max <= Q_MIN:
@@ -160,7 +163,10 @@ def run_opm(cfg):
 
         for p in range(n_polygons):
             local_idx = np.where(cell_polygon == p)[0]
-            best      = local_idx[faccum_1d[local_idx].argmin()]
+            local_fa  = faccum_1d[local_idx]
+            candidates = local_idx[local_fa == local_fa.min()]
+            elev_cand = dem[s_rows[candidates], s_cols[candidates]]
+            best = candidates[elev_cand.argmax()]
             poly_divide_idx[p]   = best
             poly_slope_divide[p] = float(slope_1d[best])
 
@@ -171,11 +177,7 @@ def run_opm(cfg):
         else:
             sd_init_arr = np.full(n_polygons, SD_max_initial, dtype=np.float64)
 
-        # Per-polygon K_sat
-        if (ksat_pp_ms is not None and len(ksat_pp_ms) == n_polygons):
-            ksat_arr = np.array(ksat_pp_ms, dtype=np.float64)
-        else:
-            ksat_arr = np.full(n_polygons, K_MS, dtype=np.float64)
+        ksat_arr = np.full(n_polygons, K_MS, dtype=np.float64)
 
         Rf_init_arr = sd_min / sd_init_arr
         H_a_arr = ratio * np.log(Rf_init_arr)

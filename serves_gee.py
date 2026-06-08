@@ -1,29 +1,29 @@
 """
 serves_gee.py
 =============
-SERVES + LULC + SoilGrids pipeline on Google Earth Engine for OPM parameters.
+SERVES + LULC + SoilGrids + HiHydroSoil pipeline on Google Earth Engine
+for OPM parameters.
 
 Computes SD_max_initial from the SERVES soil-moisture deficit formula:
     SM_deficit = (porosity − θ_SERVES) × Z_r
 where
-    porosity   = 1 − bulk_density/particle_density (from OpenLandMap)
+    porosity   = wcsat from HiHydroSoil v2.0 (saturated water content)
     θ_SERVES   = SERVES volumetric soil moisture [WP, FC]
     Z_r        = root zone depth [m] from ESA WorldCover LULC + lookup CSV
     SD_max     = max(SM_deficit) across the watershed
 
-Also derives drainable porosity φ = mean(porosity − FC) from SoilGrids,
+Also derives drainable porosity φ = mean(porosity − FC),
 and K_sat from HiHydroSoil v2.0.
 
 GEE datasets
 ------------
-    ESA/WorldCover/v200/2021                             — LULC 10m
-    LANDSAT/LC08/C02/T1_L2  +  LANDSAT/LC09/C02/T1_L2   — NDVI 30m
-    COPERNICUS/S2_SR_HARMONIZED                          — NDVI 10m (alt)
-    MODIS/061/MOD13A2                                    — NDVI 1km (alt)
-    ISRIC/SoilGrids250m/v2_0/wv0033                      — field capacity
-    ISRIC/SoilGrids250m/v2_0/wv1500                      — wilting point
-    OpenLandMap/SOL/SOL_BULKDENS-FINEEARTH_USDA-4A1H_M/v02 — bulk density
-    projects/sat-io/open-datasets/HiHydroSoilv2_0/ksat   — K_sat 250m
+    ESA/WorldCover/v200/2021                              — LULC 10m
+    LANDSAT/LC08/C02/T1_L2  +  LANDSAT/LC09/C02/T1_L2    — NDVI 30m
+    COPERNICUS/S2_SR_HARMONIZED                           — NDVI 10m (alt)
+    MODIS/061/MOD13A2                                     — NDVI 1km (alt)
+    ISRIC/SoilGrids250m/v2_0/wv0033                       — field capacity
+    ISRIC/SoilGrids250m/v2_0/wv1500                       — wilting point
+    projects/sat-io/open-datasets/HiHydroSoilv2_0/wcsat   — porosity 250m
 
 Authentication
 --------------
@@ -55,13 +55,47 @@ _DEPTH_BANDS = {
     'b200': 'val_100_200cm_mean',
 }
 
-_PARTICLE_DENSITY = 2650.0
-
 # SERVES coefficients (matches serves.js CONFIG)
 _NDVI_COEFFICIENT = 1.33
 _NDVI_INTERCEPT = -0.049
 _LANDSAT_SCALE = 0.0000275
 _LANDSAT_OFFSET = -0.2
+
+# GEE ImageCollection ID for WUDAPT Local Climate Zones (100 m global).
+_LCZ_COLLECTION = "RUB/RUBCLIM/LCZ/global_lcz_map/latest"
+
+
+def _get_land_cover_image(lulc_source, geometry=None):
+    """
+    Raw land cover class image for the given source (band renamed to 'Map').
+
+    Call only after GEE has been authenticated (inside a try block that
+    follows _authenticate()).
+
+    For LCZ the collection has 6 regional tiles; filterBounds+mosaic selects
+    the tile(s) covering the watershed.  'LCZ_Filter' is the smoothed band
+    (preferred over raw 'LCZ' for hydraulic parameter mapping).
+    """
+    if lulc_source == 'lcz':
+        col = ee.ImageCollection(_LCZ_COLLECTION)
+        if geometry is not None:
+            col = col.filterBounds(geometry)
+        return col.mosaic().select('LCZ_Filter').rename('Map')
+    return ee.Image('ESA/WorldCover/v200/2021').select('Map')
+
+
+def _get_root_depth_image(lulc_source, lut_path, geometry=None):
+    """
+    GEE image with 'root_depth' band [m], remapped from land cover class codes.
+
+    Reads class_code → root_zone_depth_m from *lut_path*.
+    Call only after GEE authentication.
+    """
+    lut = pd.read_csv(lut_path)
+    from_codes = lut['class_code'].tolist()
+    to_depths  = lut['root_zone_depth_m'].tolist()
+    lc_img = _get_land_cover_image(lulc_source, geometry=geometry)
+    return lc_img.remap(from_codes, to_depths).rename('root_depth')
 
 
 def _authenticate(project=None):
@@ -133,10 +167,10 @@ def _load_watershed_geometry(geojson_path, simplify_tolerance_m=None):
 # ── NDVI retrieval (mirrors serves.js Sections 3–5) ─────────────────────────
 
 def _get_ndvi_landsat(geometry, target_date, search_window):
-    """Landsat 8/9 NDVI composite around target_date ± search_window days."""
+    """Landsat 8/9 NDVI composite up to search_window days before target_date."""
     target = ee.Date(target_date)
     start = target.advance(-search_window, 'day')
-    end = target.advance(search_window, 'day')
+    end = target.advance(1, 'day')   # backward-only: no post-event scenes
 
     def _mask_and_ndvi(image):
         qa = image.select('QA_PIXEL')
@@ -162,10 +196,10 @@ def _get_ndvi_landsat(geometry, target_date, search_window):
 
 
 def _get_ndvi_sentinel2(geometry, target_date, search_window):
-    """Sentinel-2 NDVI composite."""
+    """Sentinel-2 NDVI composite up to search_window days before target_date."""
     target = ee.Date(target_date)
     start = target.advance(-search_window, 'day')
-    end = target.advance(search_window, 'day')
+    end = target.advance(1, 'day')   # backward-only: no post-event scenes
 
     def _mask_and_ndvi(image):
         scl = image.select('SCL')
@@ -183,12 +217,13 @@ def _get_ndvi_sentinel2(geometry, target_date, search_window):
     return s2.median().clip(geometry)
 
 
-def _get_ndvi_modis(geometry, target_date):
-    """MODIS NDVI closest 16-day composite."""
-    target = ee.Date(target_date)
+def _get_ndvi_modis(geometry, target_date, search_window=16):
+    """MODIS NDVI closest 16-day composite up to search_window*2 (min 32) days before target."""
+    target   = ee.Date(target_date)
+    lookback = max(search_window * 2, 32)   # guarantee ≥1 MODIS 16-day composite
     modis = (ee.ImageCollection('MODIS/061/MOD13A2')
              .filterBounds(geometry)
-             .filterDate(target.advance(-16, 'day'), target.advance(16, 'day')))
+             .filterDate(target.advance(-lookback, 'day'), target.advance(1, 'day')))
 
     closest = ee.Image(
         modis.map(lambda img: img.set(
@@ -204,52 +239,209 @@ def _get_ndvi(geometry, target_date, satellite, search_window):
     if satellite == 'sentinel2':
         return _get_ndvi_sentinel2(geometry, target_date, search_window)
     elif satellite == 'modis':
-        return _get_ndvi_modis(geometry, target_date)
+        return _get_ndvi_modis(geometry, target_date, search_window)
     else:
         return _get_ndvi_landsat(geometry, target_date, search_window)
 
 
-# ── Voronoi polygon builder ──────────────────────────────────────────────────
+# ── LULC / LCZ raster download ─────────────────────────────────────────────
 
-def _build_voronoi_polygons(gauge_csv_path, watershed_geojson_path, target_crs):
+def download_lulc_raster(dem_path, watershed_geojson_path, output_path,
+                         project=None):
     """
-    Build Voronoi (Thiessen) polygons from gauge locations, clip to watershed.
+    Download ESA WorldCover 2021 from GEE, pixel-aligned to the routing DEM.
 
-    Returns a GeoDataFrame in EPSG:4326 with one polygon per gauge (in gauge
-    CSV order), or None on failure.
+    Uses ``crs_transform`` + ``dimensions`` from the DEM so the output
+    raster is on the exact same grid — no rasterio reproject needed.
+
+    Caches to *output_path*; skips download if the file already exists.
+
+    Returns the output path on success, or None on failure.
     """
-    import geopandas as gpd
-    from shapely.geometry import Point, MultiPoint
-    from shapely.ops import voronoi_diagram
+    if os.path.isfile(output_path):
+        logger.info("LULC raster cached: %s", output_path)
+        return output_path
 
-    gauges = pd.read_csv(gauge_csv_path)
-    points = [Point(x, y) for x, y
-              in zip(gauges['easting_m'], gauges['northing_m'])]
+    if not GEE_AVAILABLE:
+        logger.warning("earthengine-api not installed")
+        return None
 
-    ws = gpd.read_file(watershed_geojson_path)
-    if ws.crs and str(ws.crs).upper() != target_crs.upper():
-        ws = ws.to_crs(target_crs)
-    ws_geom = ws.dissolve().geometry.iloc[0]
+    if not _authenticate(project):
+        return None
 
-    regions = voronoi_diagram(MultiPoint(points), envelope=ws_geom.envelope)
+    try:
+        import rasterio
+        import urllib.request
 
-    polygons = [None] * len(points)
-    for region in regions.geoms:
-        clipped = region.intersection(ws_geom)
-        if clipped.is_empty:
-            continue
-        for i, pt in enumerate(points):
-            if clipped.contains(pt):
-                polygons[i] = clipped
-                break
+        geometry = _load_watershed_geometry(watershed_geojson_path)
+        lulc = ee.Image('ESA/WorldCover/v200/2021').select('Map')
 
-    if any(p is None for p in polygons):
-        for i in range(len(polygons)):
-            if polygons[i] is None:
-                polygons[i] = points[i].buffer(1.0).intersection(ws_geom)
+        with rasterio.open(dem_path) as dem:
+            crs = str(dem.crs)
+            t = dem.transform
+            crs_transform = [t.a, t.b, t.c, t.d, t.e, t.f]
+            dimensions = [dem.width, dem.height]
 
-    gdf = gpd.GeoDataFrame(geometry=polygons, crs=target_crs)
-    return gdf.to_crs("EPSG:4326")
+        url = lulc.clip(geometry).getDownloadURL({
+            'crs': crs,
+            'crs_transform': crs_transform,
+            'dimensions': dimensions,
+            'format': 'GEO_TIFF',
+        })
+
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        urllib.request.urlretrieve(url, output_path)
+        logger.info("LULC raster downloaded: %s", output_path)
+        return output_path
+
+    except Exception as exc:
+        logger.warning("GEE LULC download failed: %s", exc)
+        return None
+
+
+def download_lcz_raster(dem_path, watershed_geojson_path, output_path,
+                        project=None):
+    """
+    Download WUDAPT Local Climate Zones from GEE (RUB/RUBCLIM/LCZ/global_lcz_map/latest),
+    pixel-aligned to the routing DEM.
+
+    Class codes 1–10 are built-up LCZ types; 11–17 are natural types (A–G).
+    Caches to *output_path*; skips download if the file already exists.
+
+    Returns the output path on success, or None on failure.
+    """
+    if os.path.isfile(output_path):
+        logger.info("LCZ raster cached: %s", output_path)
+        return output_path
+
+    if not GEE_AVAILABLE:
+        logger.warning("earthengine-api not installed")
+        return None
+
+    if not _authenticate(project):
+        return None
+
+    try:
+        import rasterio
+        import urllib.request
+
+        geometry = _load_watershed_geometry(watershed_geojson_path)
+        lcz = (ee.ImageCollection(_LCZ_COLLECTION)
+               .filterBounds(geometry)
+               .mosaic()
+               .select('LCZ_Filter'))
+
+        with rasterio.open(dem_path) as dem:
+            crs = str(dem.crs)
+            t = dem.transform
+            crs_transform = [t.a, t.b, t.c, t.d, t.e, t.f]
+            dimensions = [dem.width, dem.height]
+
+        url = lcz.clip(geometry).getDownloadURL({
+            'crs': crs,
+            'crs_transform': crs_transform,
+            'dimensions': dimensions,
+            'format': 'GEO_TIFF',
+        })
+
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        urllib.request.urlretrieve(url, output_path)
+        logger.info("LCZ raster downloaded: %s", output_path)
+        return output_path
+
+    except Exception as exc:
+        logger.warning("GEE LCZ download failed: %s", exc)
+        return None
+
+
+def download_deficit_raster(dem_path, watershed_geojson_path, output_path,
+                            lookup_csv_path, target_date,
+                            satellite='landsat', search_window=16,
+                            soil_depth_band='b30', project=None,
+                            lulc_source='worldcover'):
+    """
+    Download the SM-deficit raster ``(porosity − θ_SERVES) × Z_r`` from GEE,
+    pixel-aligned to the routing DEM.  Cached to *output_path*.
+
+    Returns the output path on success, or None on failure.
+    """
+    if os.path.isfile(output_path):
+        logger.info("Deficit raster cached: %s", output_path)
+        return output_path
+
+    if not GEE_AVAILABLE:
+        logger.warning("earthengine-api not installed")
+        return None
+
+    if not _authenticate(project):
+        return None
+
+    try:
+        import rasterio
+        import urllib.request
+
+        geometry = _load_watershed_geometry(watershed_geojson_path)
+
+        band = _DEPTH_BANDS.get(soil_depth_band, 'val_15_30cm_mean')
+        root_depth = _get_root_depth_image(lulc_source, lookup_csv_path,
+                                           geometry=geometry)
+        ndvi = _get_ndvi(geometry, target_date, satellite, search_window)
+
+        # NDVI coverage check (backward window only — post-storm scenes excluded)
+        _cov = ndvi.mask().rename('cov').reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=geometry,
+            scale=30.0, bestEffort=True, maxPixels=int(1e8),
+        ).getInfo().get('cov')
+        if _cov is not None:
+            _pct = 100.0 * float(_cov)
+            print(f"  NDVI coverage   |  {_pct:.0f}%  "
+                  f"(backward window={search_window} d  satellite={satellite})")
+            if _pct < 70.0:
+                print(f"  [WARN] NDVI coverage {_pct:.0f}% < 70% — deficit raster "
+                      f"may be unreliable. Consider increasing "
+                      f"SERVES_SEARCH_WINDOW beyond {search_window} days.")
+
+        fc = ee.Image('ISRIC/SoilGrids250m/v2_0/wv0033').select(band) \
+            .rename('fc')
+        wp = ee.Image('ISRIC/SoilGrids250m/v2_0/wv1500').select(band) \
+            .rename('wp')
+
+        wcsat_col = ee.ImageCollection(
+            "projects/sat-io/open-datasets/HiHydroSoilv2_0/wcsat"
+        )
+        porosity = wcsat_col.mosaic().multiply(0.0001).rename('porosity')
+
+        et_frac = ndvi.multiply(_NDVI_COEFFICIENT).add(_NDVI_INTERCEPT) \
+            .clamp(0, 1)
+        paw = fc.subtract(wp)
+        theta = et_frac.multiply(paw).add(wp)
+        theta = theta.where(theta.lt(wp), wp)
+        theta = theta.where(theta.gt(fc), fc)
+
+        deficit = porosity.subtract(theta).max(0) \
+            .multiply(root_depth).rename('deficit')
+
+        with rasterio.open(dem_path) as dem:
+            crs = str(dem.crs)
+            t = dem.transform
+            crs_transform = [t.a, t.b, t.c, t.d, t.e, t.f]
+            dimensions = [dem.width, dem.height]
+
+        url = deficit.clip(geometry).getDownloadURL({
+            'crs': crs,
+            'crs_transform': crs_transform,
+            'dimensions': dimensions,
+            'format': 'GEO_TIFF',
+        })
+
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        urllib.request.urlretrieve(url, output_path)
+        logger.info("Deficit raster downloaded: %s", output_path)
+        return output_path
+
+    except Exception as exc:
+        logger.warning("GEE deficit raster download failed: %s", exc)
+        return None
 
 
 # ── Main pipeline ────────────────────────────────────────────────────────────
@@ -265,6 +457,8 @@ def compute_opm_params(
     project=None,
     gauge_csv_path=None,
     target_crs='EPSG:32645',
+    sd_reducer='mean',
+    lulc_source='worldcover',
 ):
     """
     Single GEE pipeline: SERVES + LULC + SoilGrids → OPM parameters.
@@ -293,25 +487,37 @@ def compute_opm_params(
         return None
 
     try:
-        # ── Load lookup CSV ──────────────────────────────────────────────
-        lut = pd.read_csv(lookup_csv_path)
-        from_codes = lut['class_code'].tolist()
-        to_depths = lut['root_zone_depth_m'].tolist()
-
         band = _DEPTH_BANDS.get(soil_depth_band, 'val_15_30cm_mean')
-        bdod_band = soil_depth_band
 
         geometry = _load_watershed_geometry(
             watershed_geojson_path,
             simplify_tolerance_m=cell_size,
         )
 
-        # ── LULC → root zone depth Z_r ───────────────────────────────────
-        lulc = ee.Image('ESA/WorldCover/v200/2021').select('Map')
-        root_depth = lulc.remap(from_codes, to_depths).rename('root_depth')
+        # ── Scale: floor at Landsat 30 m (used for all reduceRegion calls) ──
+        scale = max(float(cell_size), 30.0)
+
+        # ── Land cover → root zone depth Z_r (WorldCover or LCZ) ─────────
+        lulc = _get_land_cover_image(lulc_source, geometry=geometry)
+        root_depth = _get_root_depth_image(lulc_source, lookup_csv_path,
+                                           geometry=geometry)
 
         # ── NDVI ─────────────────────────────────────────────────────────
         ndvi = _get_ndvi(geometry, target_date, satellite, search_window)
+
+        # NDVI coverage check (backward window only — post-storm scenes excluded)
+        _cov = ndvi.mask().rename('cov').reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=geometry,
+            scale=scale, bestEffort=True, maxPixels=int(1e8),
+        ).getInfo().get('cov')
+        if _cov is not None:
+            _pct = 100.0 * float(_cov)
+            print(f"  NDVI coverage   |  {_pct:.0f}%  "
+                  f"(backward window={search_window} d  satellite={satellite})")
+            if _pct < 70.0:
+                print(f"  [WARN] NDVI coverage {_pct:.0f}% < 70% — SD_max estimate "
+                      f"may be unreliable. Consider increasing "
+                      f"SERVES_SEARCH_WINDOW beyond {search_window} days.")
 
         # ── Soil properties from SoilGrids ───────────────────────────────
         fc = ee.Image('ISRIC/SoilGrids250m/v2_0/wv0033').select(band) \
@@ -319,13 +525,11 @@ def compute_opm_params(
         wp = ee.Image('ISRIC/SoilGrids250m/v2_0/wv1500').select(band) \
             .rename('wp')
 
-        # ── Porosity from bulk density (OpenLandMap) ─────────────────────
-        bdod = ee.Image(
-            'OpenLandMap/SOL/SOL_BULKDENS-FINEEARTH_USDA-4A1H_M/v02'
-        ).select(bdod_band)
-        porosity = ee.Image(1).subtract(
-            bdod.multiply(10).divide(_PARTICLE_DENSITY)
-        ).rename('porosity')
+        # ── Porosity from HiHydroSoil v2.0 wcsat ────────────────────────
+        wcsat_col = ee.ImageCollection(
+            "projects/sat-io/open-datasets/HiHydroSoilv2_0/wcsat"
+        )
+        porosity = wcsat_col.mosaic().multiply(0.0001).rename('porosity')
 
         # ── SERVES θ (mirrors serves.js:452–466) ────────────────────────
         et_frac = ndvi.multiply(_NDVI_COEFFICIENT).add(_NDVI_INTERCEPT) \
@@ -350,10 +554,9 @@ def compute_opm_params(
             .multiply(root_depth).rename('deficit')
 
         # ── Reduce over watershed ────────────────────────────────────────
-        scale = max(float(cell_size), 30.0)  # floor at Landsat 30m
-
+        _reducer = ee.Reducer.mean() if sd_reducer == 'mean' else ee.Reducer.max()
         deficit_stats = deficit.reduceRegion(
-            reducer=ee.Reducer.max(),
+            reducer=_reducer,
             geometry=geometry,
             scale=scale,
             bestEffort=True,
@@ -387,20 +590,21 @@ def compute_opm_params(
             maxPixels=int(1e9),
         ).getInfo()
 
-        # ── Root depth diagnostics ───────────────────────────────────────
+        # ── Root depth diagnostics (scale: 10 m for WorldCover, 100 m for LCZ) ─
+        _lc_scale = 100.0 if lulc_source == 'lcz' else 10.0
         root_stats = root_depth.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=geometry,
-            scale=10.0,  # WorldCover native
+            scale=_lc_scale,
             bestEffort=True,
             maxPixels=int(1e9),
         ).getInfo()
 
-        # ── LULC class distribution ──────────────────────────────────────
+        # ── Land cover class distribution ─────────────────────────────────
         lulc_hist = lulc.reduceRegion(
             reducer=ee.Reducer.frequencyHistogram(),
             geometry=geometry,
-            scale=10.0,
+            scale=_lc_scale,
             bestEffort=True,
             maxPixels=int(1e9),
         ).getInfo()
@@ -424,108 +628,16 @@ def compute_opm_params(
             )
             phi_mean = 0.10
 
-        # ── K_sat from HiHydroSoil v2.0 ─────────────────────────────────
-        ksat_m_day = None
-        ksat_per_polygon = None
-        try:
-            ksat_col = ee.ImageCollection(
-                "projects/sat-io/open-datasets/HiHydroSoilv2_0/ksat"
-            )
-            # Raw values are int × 10000; multiply by 0.0001 to get cm/day
-            ksat_img = ksat_col.mosaic().multiply(0.0001).rename('ksat')
-
-            ksat_stats = ksat_img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geometry,
-                scale=250.0,
-                bestEffort=True,
-                maxPixels=int(1e9),
-            ).getInfo()
-
-            ksat_cm_day = ksat_stats.get('ksat')
-            if ksat_cm_day is not None and float(ksat_cm_day) > 0:
-                ksat_m_day = float(ksat_cm_day) / 100.0  # cm/day → m/day
-            else:
-                logger.warning("HiHydroSoil K_sat returned null/zero; "
-                               "using config value")
-        except Exception as exc:
-            logger.warning("HiHydroSoil K_sat query failed: %s", exc)
-
-        # ── Per-polygon stats via Voronoi ────────────────────────────────
-        sd_max_per_polygon = None
-        if gauge_csv_path:
-            try:
-                voronoi_gdf = _build_voronoi_polygons(
-                    gauge_csv_path, watershed_geojson_path, target_crs
-                )
-                features = []
-                for i, geom in enumerate(voronoi_gdf.geometry):
-                    if geom.geom_type == 'MultiPolygon':
-                        coords = [list(p.exterior.coords) for p in geom.geoms]
-                        ee_geom = ee.Geometry.MultiPolygon(coords)
-                    else:
-                        coords = list(geom.exterior.coords)
-                        ee_geom = ee.Geometry.Polygon(coords)
-                    features.append(ee.Feature(ee_geom, {'zone': i}))
-
-                voronoi_fc = ee.FeatureCollection(features)
-                n_zones = len(voronoi_gdf)
-
-                # Per-polygon max deficit
-                per_poly = deficit.reduceRegions(
-                    collection=voronoi_fc,
-                    reducer=ee.Reducer.max(),
-                    scale=scale,
-                ).getInfo()
-
-                zone_max = {}
-                for feat in per_poly.get('features', []):
-                    props = feat['properties']
-                    zone_max[int(props['zone'])] = float(props.get('max', 0))
-
-                sd_max_per_polygon = [
-                    max(zone_max.get(i, sd_max), 0.001)
-                    for i in range(n_zones)
-                ]
-                logger.info("Per-polygon SD_max: %s", sd_max_per_polygon)
-
-                # Per-polygon mean K_sat
-                if ksat_m_day is not None:
-                    try:
-                        ksat_poly = ksat_img.reduceRegions(
-                            collection=voronoi_fc,
-                            reducer=ee.Reducer.mean(),
-                            scale=250.0,
-                        ).getInfo()
-
-                        zone_ksat = {}
-                        for feat in ksat_poly.get('features', []):
-                            props = feat['properties']
-                            val = props.get('mean')
-                            if val is not None and float(val) > 0:
-                                zone_ksat[int(props['zone'])] = \
-                                    float(val) / 100.0  # cm/day → m/day
-
-                        ksat_per_polygon = [
-                            zone_ksat.get(i, ksat_m_day)
-                            for i in range(n_zones)
-                        ]
-                        logger.info("Per-polygon K_sat (m/day): %s",
-                                    [f'{v:.2f}' for v in ksat_per_polygon])
-                    except Exception as exc:
-                        logger.warning("Per-polygon K_sat failed: %s", exc)
-
-            except Exception as exc:
-                logger.warning("Per-polygon Voronoi failed: %s — "
-                               "using watershed-level values", exc)
+        # NOTE: per-zone SD is no longer reduced here over Voronoi polygons.
+        # That rebuilt the precipitation partition independently and dropped
+        # zones whose station sits outside the watershed.  The engine now reduces
+        # the deficit raster (download_deficit_raster) per zone using the exact
+        # rainfall partition (cell_polygon), so the two can never disagree.
 
         result = {
             'sd_max':              sd_max,
             'sd_min':              sd_min,
             'phi':                 phi_mean,
-            'ksat_m_day':          ksat_m_day,
-            'ksat_per_polygon':    ksat_per_polygon,
-            'sd_max_per_polygon':  sd_max_per_polygon,
             'theta_min':           float(theta_stats.get('theta_min', 0)),
             'theta_max':           float(theta_stats.get('theta_max', 0)),
             'root_depth_mean':     float(root_stats.get('root_depth', 0)),
@@ -533,7 +645,7 @@ def compute_opm_params(
             'target_date':         target_date,
             'satellite':           satellite,
             'soil_depth_band':     soil_depth_band,
-            'source':              'serves_lulc_gee',
+            'source':              f'serves_{lulc_source}_gee',
         }
         return result
 

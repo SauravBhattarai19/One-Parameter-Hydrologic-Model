@@ -34,117 +34,168 @@ _OPM_SD_MIN = 0.001          # m   minimum saturation deficit
 _OPM_Q_MIN  = 0.001          # m³/s  minimum discharge (Eq 10)
 
 
-def _resolve_ksat(cfg, cell_size, gauge_csv, gee_result):
-    """
-    Resolve K_sat from config or HiHydroSoil via GEE.
-
-    Returns (ksat_ms, ksat_per_polygon_ms_or_None).
-    """
-    ksat_manual = float(getattr(cfg, 'OPM_K_SAT', 44.0)) / 86400.0
-    ksat_source = getattr(cfg, 'OPM_KSAT_SOURCE', 'manual').lower()
-
-    if ksat_source != 'gee' or gee_result is None:
-        return ksat_manual, None
-
-    ksat_gee = gee_result.get('ksat_m_day')
-    ksat_ms = ksat_gee / 86400.0 if ksat_gee is not None else ksat_manual
-
-    ksat_pp = gee_result.get('ksat_per_polygon')
-    ksat_pp_ms = [v / 86400.0 for v in ksat_pp] if ksat_pp else None
-
-    return ksat_ms, ksat_pp_ms
-
-
 def _resolve_sd_params(cfg, cell_size):
     """
     Resolve OPM soil parameters from config (manual) or GEE.
 
-    Returns dict with keys: sd_max, sd_min, phi, sd_max_per_polygon,
-    ksat_ms, ksat_per_polygon_ms.
+    Returns dict with keys: sd_max, sd_min, phi, sd_max_per_polygon, ksat_ms,
+    deficit_raster.  Per-zone SD is reduced from 'deficit_raster' in
+    _init_vsa_opm using the rainfall partition (cell_polygon), not here.
     """
     sd_source   = getattr(cfg, 'OPM_SD_SOURCE', 'manual').lower()
-    ksat_source = getattr(cfg, 'OPM_KSAT_SOURCE', 'manual').lower()
-    ksat_manual = float(getattr(cfg, 'OPM_K_SAT', 44.0)) / 86400.0
+    ksat_ms     = float(getattr(cfg, 'OPM_K_SAT', 44.0)) / 86400.0
 
     _manual_params = {
         'sd_max': float(cfg.OPM_SD_MAX_INITIAL),
         'sd_min': _OPM_SD_MIN,
         'phi': float(getattr(cfg, 'OPM_PHI', 0.10)),
         'sd_max_per_polygon': None,
-        'ksat_ms': ksat_manual,
-        'ksat_per_polygon_ms': None,
+        'ksat_ms': ksat_ms,
+        'deficit_raster': None,
     }
 
-    needs_gee = sd_source == 'gee' or ksat_source == 'gee'
-    if not needs_gee:
+    if sd_source != 'gee':
         return _manual_params
 
-    target_date = getattr(cfg, 'SERVES_TARGET_DATE', None)
-    if target_date is None and sd_source == 'gee':
-        print("  [WARN] SERVES_TARGET_DATE not set; using manual SD/phi values.")
+    # Primary: EVENT_START_UTC is the event start — its date IS the SERVES target date.
+    target_date = None
+    evt = getattr(cfg, 'EVENT_START_UTC', None)
+    if evt:
+        target_date = str(evt).split()[0]   # 'YYYY-MM-DD'
+        print(f"  SERVES target date → {target_date}  (from EVENT_START_UTC)")
+
+    # Legacy fallback: IMERG_START_LOCAL (for old configs that predate EVENT_START_UTC)
+    if target_date is None:
+        method = getattr(cfg, 'PRECIP_METHOD', '').lower()
+        start  = getattr(cfg, 'IMERG_START_LOCAL', None)
+        if method.startswith('imerg') and start:
+            target_date = str(start).split()[0]
+            print(f"  SERVES target date → {target_date}  "
+                  f"(legacy: derived from IMERG_START_LOCAL)")
+
+    if target_date is None:
+        print("  [WARN] EVENT_START_UTC not set; using manual SD/phi values.")
+        return _manual_params
 
     try:
-        from serves_gee import compute_opm_params
+        from serves_gee import compute_opm_params, download_deficit_raster
     except ImportError:
         print("  [WARN] earthengine-api not installed; using manual values.")
         return _manual_params
 
-    gauge_csv = getattr(cfg, 'PRECIP_GAUGE_FILE', None)
-    precip_method = getattr(cfg, 'PRECIP_METHOD', 'uniform').lower()
-    if precip_method not in ('thiessen', 'idw'):
-        gauge_csv = None
+    geojson = getattr(cfg, 'OPM_WATERSHED_GEOJSON', 'output/watershed.geojson')
+    sat     = getattr(cfg, 'SERVES_SATELLITE', 'landsat')
+    window  = getattr(cfg, 'SERVES_SEARCH_WINDOW', 16)
+    band    = getattr(cfg, 'OPM_SOILGRIDS_DEPTH', 'b30')
+    project = getattr(cfg, 'GEE_PROJECT', None)
 
+    # Select lookup CSV and GEE land cover source to match MANNINGS_N_SOURCE.
+    _n_source = getattr(cfg, 'MANNINGS_N_SOURCE', 'lulc').lower()
+    if _n_source == 'lcz':
+        lut          = getattr(cfg, 'LCZ_LOOKUP_CSV',  'lcz_lookup.csv')
+        gee_lc_source = 'lcz'
+    else:
+        lut          = getattr(cfg, 'LULC_LOOKUP_CSV', 'lulc_lookup.csv')
+        gee_lc_source = 'worldcover'
+
+    # Watershed-level SD_max + phi + diagnostics (scalars; no partition).
     gee_result = compute_opm_params(
-        watershed_geojson_path=getattr(cfg, 'OPM_WATERSHED_GEOJSON',
-                                       'output/watershed.geojson'),
-        cell_size=cell_size,
-        lookup_csv_path=getattr(cfg, 'LULC_LOOKUP_CSV', 'lulc_lookup.csv'),
-        target_date=target_date,
-        satellite=getattr(cfg, 'SERVES_SATELLITE', 'landsat'),
-        search_window=getattr(cfg, 'SERVES_SEARCH_WINDOW', 16),
-        soil_depth_band=getattr(cfg, 'OPM_SOILGRIDS_DEPTH', 'b30'),
-        project=getattr(cfg, 'GEE_PROJECT', None),
-        gauge_csv_path=gauge_csv,
-        target_crs=getattr(cfg, 'TARGET_CRS_EPSG', 'EPSG:32645'),
+        watershed_geojson_path=geojson, cell_size=cell_size,
+        lookup_csv_path=lut, target_date=target_date,
+        satellite=sat, search_window=window, soil_depth_band=band,
+        project=project,
+        sd_reducer=getattr(cfg, 'OPM_SD_REDUCER', 'mean'),
+        lulc_source=gee_lc_source,
     )
 
-    # ── SD / phi: from GEE or manual ─────────────────────────────────────
-    if sd_source == 'gee' and gee_result is not None and target_date is not None:
-        sd_max  = gee_result['sd_max']
-        phi     = gee_result['phi']
-        per_poly = gee_result.get('sd_max_per_polygon')
+    if gee_result is not None:
+        sd_max = gee_result['sd_max']
+        phi    = gee_result['phi']
     else:
-        sd_max  = float(cfg.OPM_SD_MAX_INITIAL)
-        phi     = float(getattr(cfg, 'OPM_PHI', 0.10))
-        per_poly = None
+        sd_max = float(cfg.OPM_SD_MAX_INITIAL)
+        phi    = float(getattr(cfg, 'OPM_PHI', 0.10))
 
-    # ── K_sat: from GEE or manual ────────────────────────────────────────
-    ksat_ms, ksat_pp_ms = _resolve_ksat(cfg, cell_size, gauge_csv, gee_result)
+    # Per-cell deficit raster (aligned to the routing grid, clipped to the
+    # watershed).  The engine reduces it per precipitation zone (cell_polygon),
+    # so the SD partition is identical to the rainfall partition.
+    #
+    # Date-stamp the filename so each event caches its own raster:
+    #   deficit_serves_2024-09-26.tif vs deficit_serves_2024-10-05.tif
+    # Re-runs of the same event reuse the cached file (no re-download).
+    # Falls back to the plain name when target_date is None (manual SD mode).
+    out_path = getattr(cfg, 'OPM_DEFICIT_RASTER', None) \
+        or (getattr(cfg, 'OUTPUT_DIR', 'output/') + 'deficit_serves.tif')
+    if target_date:
+        import os as _os
+        _base, _ext = _os.path.splitext(out_path)
+        out_path = f"{_base}_{target_date}{_ext}"
+    deficit_raster = None
+    try:
+        deficit_raster = download_deficit_raster(
+            dem_path=cfg.ROUTING_DEM_PATH, watershed_geojson_path=geojson,
+            output_path=out_path, lookup_csv_path=lut, target_date=target_date,
+            satellite=sat, search_window=window, soil_depth_band=band,
+            project=project, lulc_source=gee_lc_source,
+        )
+    except Exception as exc:
+        print(f"  [WARN] deficit raster download failed: {exc}")
 
     # ── Print diagnostics ────────────────────────────────────────────────
-    print(f"  OPM params    |  SD_max={sd_max:.4f} m  (source={sd_source})"
-          f"  phi={phi:.4f}"
-          f"  K_sat={ksat_ms * 86400:.2f} m/day (source={ksat_source})")
+    print(f"  OPM params    |  SD_max(ws)={sd_max:.4f} m  (source={sd_source})"
+          f"  phi={phi:.4f}  K_sat={ksat_ms * 86400:.2f} m/day")
     if gee_result is not None:
         print(f"                |  theta=[{gee_result.get('theta_min', 0):.3f},"
               f" {gee_result.get('theta_max', 0):.3f}]"
               f"  Z_r_mean={gee_result.get('root_depth_mean', 0):.2f} m")
-    if per_poly:
-        print(f"                |  Per-polygon SD_max: "
-              f"{[f'{v:.3f}' for v in per_poly]}")
-    if ksat_pp_ms:
-        ksat_pp_mday = [v * 86400 for v in ksat_pp_ms]
-        print(f"                |  Per-polygon K_sat:  "
-              f"{[f'{v:.2f}' for v in ksat_pp_mday]} m/day")
+    print(f"                |  deficit raster: "
+          f"{'ready' if deficit_raster else 'unavailable → per-zone SD = watershed SD'}")
 
     return {
         'sd_max': sd_max,
         'sd_min': _OPM_SD_MIN,
         'phi': phi,
-        'sd_max_per_polygon': per_poly,
+        'sd_max_per_polygon': None,   # resolved per-zone from the raster instead
         'ksat_ms': ksat_ms,
-        'ksat_per_polygon_ms': ksat_pp_ms,
+        'deficit_raster': deficit_raster,
     }
+
+
+def _per_zone_sd_from_raster(deficit_path, cell_polygon, n_polygons,
+                             s_rows, s_cols, reducer, sd_min, ws_default):
+    """
+    Reduce the per-cell deficit raster into one SD_max per precipitation zone.
+
+    For each zone p, SD_max[p] = mean|max of the deficit over ONLY the watershed
+    cells that zone owns (cell_polygon == p) — the exact same nearest-station
+    partition the rainfall uses.  Zones with no deficit data (or out-of-basin
+    stations that own no cells) get *ws_default* (the watershed SD_max).  The
+    result is therefore watershed-bounded and consistent with the rain zoning.
+    """
+    with rasterio.open(deficit_path) as src:
+        deficit2d = src.read(1).astype(np.float64)
+        nodata    = src.nodata
+    if nodata is not None:
+        deficit2d[deficit2d == nodata] = np.nan
+
+    _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+    sr = _to_np(s_rows); sc = _to_np(s_cols)
+
+    # Guard against a cached raster on a different grid than the routing DEM.
+    if sr.max() >= deficit2d.shape[0] or sc.max() >= deficit2d.shape[1]:
+        print("  [WARN] deficit raster grid ≠ routing grid; "
+              "per-zone SD → watershed SD.")
+        return np.full(n_polygons, ws_default, dtype=np.float64)
+
+    deficit_1d = deficit2d[sr, sc]                 # (n_cells,) deficit per cell
+    finite     = np.isfinite(deficit_1d)
+    redux      = np.max if reducer == 'max' else np.mean
+
+    sd = np.full(n_polygons, ws_default, dtype=np.float64)
+    for p in range(n_polygons):
+        m = (cell_polygon == p) & finite
+        if m.any():
+            sd[p] = float(redux(deficit_1d[m]))
+    return np.maximum(sd, sd_min)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,9 +464,7 @@ class RunoffEngine:
         SD_max_initial  = params['sd_max']
         sd_min          = params['sd_min']
         phi             = params['phi']
-        sd_max_per_poly = params['sd_max_per_polygon']
         ksat_ms         = params['ksat_ms']
-        ksat_pp_ms      = params['ksat_per_polygon_ms']
 
         self._sd_min  = sd_min
         self._phi     = phi
@@ -451,19 +500,48 @@ class RunoffEngine:
             # sandbox state so that spatially variable rainfall drives local
             # VSA expansion independently.
             cell_polygon = np.asarray(cell_polygon).ravel()
-            n_polygons   = int(cell_polygon.max()) + 1
+            # One zone per precipitation gauge — not cell_polygon.max()+1, which
+            # undercounts when trailing gauges have no nearest cell (e.g. IMERG
+            # edge pixels).  Aligning n_polygons with the gauge count keeps the
+            # per-polygon state arrays in step with sd_max_per_polygon (one value
+            # per gauge from SERVES) and with downstream consumers that index by
+            # gauge id.  Empty zones are handled by the fallback divide below.
+            precip_engine = grid_data.get('precip_engine')
+            n_gauges      = getattr(precip_engine, '_n_gauges', None)
+            n_polygons    = int(n_gauges) if n_gauges \
+                else int(cell_polygon.max()) + 1
 
             # Ensure NumPy for the init loop (faccum_1d / slope_1d may be CuPy)
             _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
             faccum_np = _to_np(faccum_1d)
             slope_np  = _to_np(slope_1d)
+            dem = grid_data['dem']
+            s_rows = grid_data['s_rows']
+            s_cols = grid_data['s_cols']
 
             divide_idx     = np.empty(n_polygons, dtype=np.intp)
             slope_divide   = np.empty(n_polygons, dtype=np.float64)
 
+            # Catchment-wide fallback divide (min faccum, highest elevation on tie).
+            # Used for zones that contain no watershed cells — possible when the
+            # precipitation stations come from a gridded product (e.g. IMERG) whose
+            # buffered footprint includes pixels with no cell nearest to them.  Such
+            # zones never index any real cell, so the fallback only avoids the
+            # empty-array reduction; it does not affect results.
+            g_cand = np.where(faccum_np == faccum_np.min())[0]
+            g_elev = dem[s_rows[g_cand], s_cols[g_cand]]
+            global_divide = int(g_cand[g_elev.argmax()])
+
             for p in range(n_polygons):
                 local_idx = np.where(cell_polygon == p)[0]
-                best      = local_idx[faccum_np[local_idx].argmin()]
+                if local_idx.size == 0:
+                    divide_idx[p]   = global_divide
+                    slope_divide[p] = float(slope_np[global_divide])
+                    continue
+                local_fa  = faccum_np[local_idx]
+                candidates = local_idx[local_fa == local_fa.min()]
+                elev = dem[s_rows[candidates], s_cols[candidates]]
+                best = candidates[elev.argmax()]
                 divide_idx[p]   = best
                 slope_divide[p] = float(slope_np[best])
 
@@ -473,22 +551,25 @@ class RunoffEngine:
             self._polygon_divide_idx   = divide_idx
             self._polygon_slope_divide = slope_divide
 
-            # Per-polygon SD_max_initial and H_a
-            if (sd_max_per_poly is not None
-                    and len(sd_max_per_poly) == n_polygons):
-                sd_init_arr = np.array(sd_max_per_poly, dtype=np.float64)
+            # Per-zone SD_max from the deficit raster, reduced over each zone's
+            # OWN watershed cells (same partition as rainfall).  Zones with no
+            # deficit data fall back to the watershed SD_max.
+            deficit_raster = params.get('deficit_raster')
+            reducer = getattr(cfg, 'OPM_SD_REDUCER', 'mean').lower()
+            if deficit_raster:
+                sd_init_arr = _per_zone_sd_from_raster(
+                    deficit_raster, cell_polygon, n_polygons,
+                    s_rows, s_cols, reducer, sd_min, SD_max_initial)
+                n_real = int((np.abs(sd_init_arr - SD_max_initial) > 1e-9).sum())
+                print(f"                |  Per-zone SD ({reducer}) over watershed "
+                      f"cells: {n_real}/{n_polygons} zones populated, "
+                      f"range=[{sd_init_arr.min():.3f}, {sd_init_arr.max():.3f}] m")
             else:
                 sd_init_arr = np.full(n_polygons, SD_max_initial,
                                       dtype=np.float64)
             self._SD_max_initial = sd_init_arr
 
-            # Per-polygon K_sat
-            if (ksat_pp_ms is not None
-                    and len(ksat_pp_ms) == n_polygons):
-                self._ksat_ms = np.array(ksat_pp_ms, dtype=np.float64)
-            else:
-                self._ksat_ms = np.full(n_polygons, ksat_ms,
-                                         dtype=np.float64)
+            self._ksat_ms = np.full(n_polygons, ksat_ms, dtype=np.float64)
 
             Rf_init_arr = sd_min / sd_init_arr
             H_a_arr = ratio * np.log(Rf_init_arr)
@@ -516,7 +597,17 @@ class RunoffEngine:
         else:
             # ── Single-sandbox mode (uniform rainfall) ────────────────────────
             self._per_polygon  = False
-            self._slope_divide = float(slope_1d[0])
+            _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+            faccum_np = _to_np(faccum_1d)
+            slope_np  = _to_np(slope_1d)
+            dem = grid_data['dem']
+            s_rows = grid_data['s_rows']
+            s_cols = grid_data['s_cols']
+            min_fa = faccum_np.min()
+            candidates = np.where(faccum_np == min_fa)[0]
+            elev = dem[s_rows[candidates], s_cols[candidates]]
+            divide_cell = candidates[elev.argmax()]
+            self._slope_divide = float(slope_np[divide_cell])
 
             self._SD_max_initial = SD_max_initial  # scalar
             Rf_init = sd_min / SD_max_initial

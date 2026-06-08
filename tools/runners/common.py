@@ -1,33 +1,16 @@
 """
-run_all_floods.py
-=================
-End-to-end GPU routing pipeline for every FLOOD event.
+common.py
+=========
+Shared helpers for the flood-runner pipelines (gauge.py, imerg.py) so they
+import from one place instead of one reaching into the other.
 
-Stages timed
-------------
-  [0] process_dem     – reproject / fill / flow-dir / accumulation / watershed
-                        (CPU-only via pysheds; runs once)
-  [1] GAG → OPM       – convert .gag rainfall files to OPM CSVs   (CPU-only)
-  [2a] GPU init       – initialise_grid (BACKEND='gpu')
-  [2b] GPU loop       – run_time_loop   (BACKEND='gpu')
-
-Output
-------
-  output/hydrograph_<EVENT>.csv
-  output/comparison_<EVENT>.png
-  output/summary_all_floods.csv
-  Console: timing table + peak-Q stats
-
-Usage
------
-  cd /path/to/OPM
-  conda run -n opm python tools/run_all_floods.py
+Holds: .gag parsing / OPM-CSV writing, observed-discharge loading, performance
+metrics, the comparison plot, and the timing-table printer.  Nothing here knows
+about the output folder — each pipeline decides where its artifacts land.
 """
 
 import re
 import csv
-import sys
-import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -38,17 +21,53 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-REPO_ROOT   = Path(__file__).resolve().parent.parent
-GSSHA_DIR   = REPO_ROOT / "test_data" / "gssha_format"
-OPM_DIR     = REPO_ROOT / "test_data" / "opm_format"
-OUTPUT_DIR  = REPO_ROOT / "output"
-
-sys.path.insert(0, str(REPO_ROOT))
+# Paths/constants live in runner_config.py (one place to edit).
+from .runner_config import REPO_ROOT, GSSHA_DIR, OPM_DIR
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Helpers
+# Output-folder cascade
+# ══════════════════════════════════════════════════════════════════════════════
+
+def apply_output_dir(config, out_dir):
+    """
+    Point the in-memory model config at *out_dir* and re-derive EVERY path that
+    config.py builds from OUTPUT_DIR, so overriding the folder at runtime
+    cascades just like editing OUTPUT_DIR in config.py would.
+
+    Mirrors the derivations in config.py §2/§3/§6/§9.  Returns the normalised
+    out_dir string (always trailing-slash).
+    """
+    out_dir = str(out_dir)
+    if not out_dir.endswith("/"):
+        out_dir += "/"
+    config.OUTPUT_DIR                  = out_dir
+    config.ROUTING_DEM_PATH            = out_dir + "clipped_dem.tif"
+    config.ROUTING_FLOW_DIR_PATH       = out_dir + "flow_direction.tif"
+    config.ROUTING_FLOW_ACCUM_PATH     = out_dir + "clipped_flow_accumulation.tif"
+    config.ROUTING_WATERSHED_MASK_PATH = out_dir + "watershed.tif"
+    config.OPM_WATERSHED_GEOJSON       = out_dir + "watershed.geojson"
+    config.OPM_DEFICIT_RASTER          = None   # date-stamped per event in _resolve_sd_params
+    config.PRECIP_IMERG_DIR            = out_dir + "imerg/"
+    config.HYDROGRAPH_CSV              = out_dir + "hydrograph.csv"
+    return out_dir
+
+
+def run_process_dem(config, out_dir) -> float:
+    """Run process_dem once into *out_dir* (shared watershed for all events)."""
+    import os
+    import time
+    apply_output_dir(config, out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    import process_dem
+    process_dem.OUTPUT_DIR = config.OUTPUT_DIR   # in case it was already imported
+    t0 = time.perf_counter()
+    process_dem.main()
+    return time.perf_counter() - t0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Formatting
 # ══════════════════════════════════════════════════════════════════════════════
 
 def hms(seconds: float) -> str:
@@ -68,18 +87,7 @@ def hms(seconds: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 0 — process_dem  (CPU only, run once)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_process_dem() -> float:
-    import process_dem
-    t0 = time.perf_counter()
-    process_dem.main()
-    return time.perf_counter() - t0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 1 — GAG → OPM conversion  (CPU, per-event)
+# .gag parsing  /  GAG → OPM conversion
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_gag(filepath: Path) -> dict:
@@ -129,43 +137,7 @@ def gag_sim_hours(data: dict) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 2 — Router (GPU)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_router(gauge_csv: Path, ts_csv: Path, sim_hours: float,
-               event_start_date: str = None) -> tuple:
-    """
-    Run the kinematic-wave router for one event on GPU.
-
-    Returns
-    -------
-    hydrograph  : list of (time_s, Q_m3s) tuples
-    t_init      : wall-clock seconds for initialise_grid
-    t_loop      : wall-clock seconds for run_time_loop
-    """
-    import config
-    import kinematic_wave_router as kwr
-
-    config.PRECIP_GAUGE_FILE           = str(gauge_csv.relative_to(REPO_ROOT))
-    config.PRECIP_TIMESERIES_FILE      = str(ts_csv.relative_to(REPO_ROOT))
-    config.TOTAL_SIMULATION_TIME_HOURS = sim_hours
-    config.BACKEND                     = 'gpu'
-    if hasattr(config, 'SERVES_TARGET_DATE'):
-        config.SERVES_TARGET_DATE      = event_start_date
-
-    t0 = time.perf_counter()
-    grid_data = kwr.initialise_grid(config)
-    t_init    = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    hydrograph = kwr.run_time_loop(grid_data, config)
-    t_loop     = time.perf_counter() - t0
-
-    return hydrograph, t_init, t_loop
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 3 — Load observed hydrograph
+# Observed hydrograph + metrics
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_discharge_csv(csv_path: Path, event_start: datetime) -> pd.DataFrame:
@@ -174,10 +146,6 @@ def load_discharge_csv(csv_path: Path, event_start: datetime) -> pd.DataFrame:
     df = df.rename(columns={"discharge_m3s": "Q_m3s"})[["time_min", "Q_m3s"]]
     return df[df["time_min"] >= 0].reset_index(drop=True)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 4 — Performance metrics
-# ══════════════════════════════════════════════════════════════════════════════
 
 def compute_metrics(otl: pd.DataFrame, hydrograph: list) -> dict:
     obs_s   = otl["time_min"].values * 60.0
@@ -200,7 +168,7 @@ def compute_metrics(otl: pd.DataFrame, hydrograph: list) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 5 — Comparison plot
+# Comparison plot
 # ══════════════════════════════════════════════════════════════════════════════
 
 def make_plot(event_name: str, event_start: datetime,
@@ -282,11 +250,15 @@ def make_plot(event_name: str, event_start: datetime,
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close(fig)
-    print(f"  Plot saved → {out_png.relative_to(REPO_ROOT)}")
+    try:
+        rel = out_png.relative_to(REPO_ROOT)
+    except ValueError:
+        rel = out_png
+    print(f"  Plot saved → {rel}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Timing table printers
+# Timing table
 # ══════════════════════════════════════════════════════════════════════════════
 
 def print_summary_table(t_dem: float, rows: list) -> None:
@@ -313,137 +285,3 @@ def print_summary_table(t_dem: float, rows: list) -> None:
     print(f"  process_dem (one-time)           :  {hms(t_dem)}")
     print(f"  Total wall time (dem + routing)  :  {hms(t_dem + total)}")
     print("═" * W)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Main pipeline
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    import gpu_utils
-
-    gag_files = sorted(GSSHA_DIR.glob("*.gag"))
-    if not gag_files:
-        print(f"No .gag files found in {GSSHA_DIR}")
-        sys.exit(1)
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
-    if not gpu_utils.cupy_available():
-        print("[ERROR] CuPy not available — this script requires a GPU.")
-        sys.exit(1)
-
-    import cupy as cp
-    mem = cp.cuda.Device(0).mem_info
-    print(f"GPU detected: {mem[1]/1e9:.1f} GB VRAM  ({mem[0]/1e9:.1f} GB free)")
-
-    # ── Stage 0: process_dem ─────────────────────────────────────────────────
-    print("\n" + "=" * 68)
-    print("  STAGE 0 — process_dem  (CPU only, one-time)")
-    print("=" * 68)
-    t_dem = run_process_dem()
-    print(f"\n  process_dem finished in  {hms(t_dem)}")
-
-    all_metrics  = []
-    summary_rows = []
-
-    for gag_path in gag_files:
-        date_tag   = re.search(r'(\d{6}_\d{6})', gag_path.stem)
-        date_tag   = date_tag.group(1) if date_tag else gag_path.stem
-        event_name = date_tag
-        disc_path  = GSSHA_DIR / f"discharge_{date_tag}.csv"
-
-        print("\n" + "=" * 68)
-        print(f"  EVENT: {event_name}")
-        print("=" * 68)
-
-        # ── Stage 1: GAG → OPM ───────────────────────────────────────────────
-        print(f"\n[1] GAG → OPM  ({gag_path.name})")
-        t_gag_0   = time.perf_counter()
-        gag_data  = parse_gag(gag_path)
-        opm_dir   = OPM_DIR / event_name
-        write_opm_csvs(gag_data, opm_dir)
-        t_gag     = time.perf_counter() - t_gag_0
-        event_start = gag_event_start(gag_data)
-        sim_hours   = gag_sim_hours(gag_data)
-        print(f"    Start: {event_start}  |  Duration: {sim_hours:.0f} h  "
-              f"|  Converted in {hms(t_gag)}")
-
-        gauge_csv = opm_dir / "gauges.csv"
-        ts_csv    = opm_dir / "timeseries.csv"
-
-        # ── Stage 2: GPU routing ──────────────────────────────────────────────
-        print(f"\n[2] GPU routing  (BACKEND='gpu')")
-        hydrograph, t_init, t_loop = run_router(
-            gauge_csv, ts_csv, sim_hours,
-            event_start_date=event_start.strftime('%Y-%m-%d'),
-        )
-        print(f"    init={hms(t_init)}  loop={hms(t_loop)}  "
-              f"total={hms(t_init + t_loop)}")
-
-        # Save hydrograph
-        hyd_csv = OUTPUT_DIR / f"hydrograph_{event_name}.csv"
-        pd.DataFrame({
-            "time_s":  [h[0] for h in hydrograph],
-            "time_hr": [h[0] / 3600 for h in hydrograph],
-            "Q_m3s":   [h[1] for h in hydrograph],
-        }).to_csv(hyd_csv, index=False)
-        print(f"    Hydrograph saved → {hyd_csv.relative_to(REPO_ROOT)}")
-
-        summary_rows.append({
-            "event":  event_name,
-            "sim_h":  sim_hours,
-            "t_init": t_init,
-            "t_loop": t_loop,
-        })
-
-        # ── Stage 3: Observed data + metrics ─────────────────────────────────
-        if not disc_path.exists():
-            print(f"\n  [WARN] {disc_path.name} not found — skipping plot.")
-            continue
-
-        print(f"\n[3] Metrics & plot")
-        otl     = load_discharge_csv(disc_path, event_start)
-        metrics = compute_metrics(otl, hydrograph)
-        print(f"    NSE={metrics['nse']:.3f}  PBIAS={metrics['pbias']:.1f}%  "
-              f"Obs Qp={metrics['obs_peak_Q']:.1f} m³/s  "
-              f"Mod Qp={metrics['mod_peak_Q']:.1f} m³/s")
-
-        out_png = OUTPUT_DIR / f"comparison_{event_name}.png"
-        make_plot(event_name, event_start, otl, hydrograph, ts_csv, metrics, out_png)
-
-        all_metrics.append({
-            "event":       event_name,
-            "start":       event_start.strftime("%Y-%m-%d"),
-            "nse":         round(metrics["nse"], 3),
-            "pbias_pct":   round(metrics["pbias"], 1),
-            "obs_peak_Q":  round(metrics["obs_peak_Q"], 1),
-            "obs_peak_hr": round(metrics["obs_peak_s"] / 3600, 2),
-            "mod_peak_Q":  round(metrics["mod_peak_Q"], 1),
-            "mod_peak_hr": round(metrics["mod_peak_s"] / 3600, 2),
-        })
-
-    # ── Grand summary ─────────────────────────────────────────────────────────
-    print_summary_table(t_dem, summary_rows)
-
-    # Save timing CSV
-    timing_csv = OUTPUT_DIR / "timing_gpu.csv"
-    pd.DataFrame([{
-        "event":       r["event"],
-        "sim_hours":   r["sim_h"],
-        "init_s":      round(r["t_init"], 2),
-        "loop_s":      round(r["t_loop"], 2),
-        "total_s":     round(r["t_init"] + r["t_loop"], 2),
-    } for r in summary_rows]).to_csv(timing_csv, index=False)
-    print(f"\n  Timing CSV saved → {timing_csv.relative_to(REPO_ROOT)}")
-
-    if all_metrics:
-        metrics_csv = OUTPUT_DIR / "summary_all_floods.csv"
-        pd.DataFrame(all_metrics).to_csv(metrics_csv, index=False)
-        print(f"  Metrics CSV saved → {metrics_csv.relative_to(REPO_ROOT)}")
-
-    print("\nAll done.")
-
-
-if __name__ == "__main__":
-    main()

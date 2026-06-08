@@ -122,6 +122,11 @@ def initialise_grid(cfg):
         "transform"  : transform,
     }
 
+    # ── Resolve spatially variable Manning's n ──────────────────────────────
+    print("  Resolving Manning's n...")
+    n_1d = ru.resolve_mannings_n(cfg, grid_data)
+    grid_data["n_1d"] = n_1d
+
     # ── Transfer hot arrays to GPU (must happen BEFORE engine construction) ───
     # Engines read grid_data['faccum_1d'] and grid_data['slope_1d'] during
     # __init__; they must already be CuPy arrays so engine state is on GPU.
@@ -130,9 +135,11 @@ def initialise_grid(cfg):
         slope_1d  = gpu_utils.to_device(slope_1d.astype(_dtype),  xp)
         ds_idx    = gpu_utils.to_device(ds_idx,                    xp)
         faccum_1d = gpu_utils.to_device(faccum_1d.astype(_dtype),  xp)
+        n_1d      = gpu_utils.to_device(n_1d.astype(_dtype),       xp)
         grid_data["slope_1d"]  = slope_1d
         grid_data["ds_idx"]    = ds_idx
         grid_data["faccum_1d"] = faccum_1d
+        grid_data["n_1d"]      = n_1d
 
     grid_data["xp"] = xp   # carried into run_time_loop
 
@@ -175,7 +182,7 @@ def run_time_loop(grid_data, cfg):
     """
     dt        = cfg.TIME_STEP_SECONDS
     n_steps   = int(cfg.TOTAL_SIMULATION_TIME_HOURS * 3600.0 / dt)
-    n         = cfg.MANNINGS_N
+    n         = grid_data.get("n_1d", cfg.MANNINGS_N)
 
     # Output write frequency: every N steps (rounded up to at least 1)
     _out_interval = getattr(cfg, 'OUTPUT_INTERVAL_SECONDS', None)
@@ -215,7 +222,8 @@ def run_time_loop(grid_data, cfg):
     # limiter is critical. Print an advisory so the user can reduce dt if needed.
     # Use .item() so the comparison works for both CuPy and NumPy scalars.
     max_slope         = float(slope_1d.max().item())
-    V_at_1m_max_slope = (1.0 / n) * (1.0 ** (2.0 / 3.0)) * (max_slope ** 0.5)
+    n_min             = float(n.min().item()) if hasattr(n, 'min') else float(n)
+    V_at_1m_max_slope = (1.0 / n_min) * (1.0 ** (2.0 / 3.0)) * (max_slope ** 0.5)
     C_indicator       = V_at_1m_max_slope * dt / dx
     safe_dt           = dx / V_at_1m_max_slope
     if C_indicator > 1.0:

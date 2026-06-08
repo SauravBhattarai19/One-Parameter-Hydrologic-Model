@@ -329,3 +329,250 @@ def build_rainfall_array(shape, intensity_mm_hr, duration_hours, dt_seconds, t_s
                      if t_seconds < duration_hours * 3600.0
                      else 0.0)
     return np.full(shape, rain_ms_value, dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# 7.  Raster alignment
+# ---------------------------------------------------------------------------
+
+def align_raster_to_dem(src_path, dem_path, resampling='nearest'):
+    """
+    Reproject/resample *src_path* to exactly match the routing DEM grid.
+
+    Returns a 2-D numpy array with the same (height, width) as the DEM.
+    """
+    from rasterio.warp import reproject, Resampling
+
+    METHODS = {
+        'nearest':  Resampling.nearest,
+        'bilinear': Resampling.bilinear,
+    }
+
+    with rasterio.open(dem_path) as dem:
+        dst_crs       = dem.crs
+        dst_transform = dem.transform
+        dst_shape     = (dem.height, dem.width)
+
+    with rasterio.open(src_path) as src:
+        dst_array = np.empty(dst_shape, dtype=src.dtypes[0])
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst_array,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=METHODS.get(resampling, Resampling.nearest),
+        )
+    return dst_array
+
+
+# ---------------------------------------------------------------------------
+# 8.  Spatially variable Manning's n
+# ---------------------------------------------------------------------------
+
+def resolve_mannings_n(cfg, grid_data):
+    """
+    Build a per-cell Manning's n array from config.
+
+    Supports three sources (``MANNINGS_N_SOURCE``):
+      scalar  – uniform value from ``MANNINGS_N``
+      lulc    – LULC class codes remapped via ``LULC_LOOKUP_CSV``
+      raster  – pre-computed Manning's n GeoTIFF
+
+    In all modes, cells whose flow accumulation exceeds a threshold
+    are overridden with ``MANNINGS_N_CHANNEL`` (if not None).
+
+    Returns 1-D float64 array of shape ``(n_cells,)``.
+    """
+    import os
+    import pandas as pd
+
+    source     = getattr(cfg, 'MANNINGS_N_SOURCE', 'scalar').lower()
+    n_fallback = float(cfg.MANNINGS_N)
+    s_rows     = grid_data['s_rows']
+    s_cols     = grid_data['s_cols']
+    n_cells    = len(s_rows)
+
+    # ── Source: scalar ────────────────────────────────────────────────────
+    if source == 'scalar':
+        n_1d = np.full(n_cells, n_fallback, dtype=np.float64)
+
+    # ── Source: pre-computed raster ───────────────────────────────────────
+    elif source == 'raster':
+        path = getattr(cfg, 'MANNINGS_N_RASTER_PATH', None)
+        if path is None or not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"MANNINGS_N_SOURCE='raster' but MANNINGS_N_RASTER_PATH "
+                f"not found: {path}"
+            )
+        dem_path = cfg.ROUTING_DEM_PATH
+        n_2d = align_raster_to_dem(path, dem_path, resampling='bilinear')
+        n_1d = n_2d[s_rows, s_cols].astype(np.float64)
+        bad = (n_1d <= 0) | ~np.isfinite(n_1d)
+        if bad.any():
+            n_1d[bad] = n_fallback
+
+    # ── Source: LULC class codes → lookup CSV ────────────────────────────
+    elif source == 'lulc':
+        lulc_path = getattr(cfg, 'MANNINGS_N_LULC_PATH', 'gee')
+        dem_path  = cfg.ROUTING_DEM_PATH
+
+        if str(lulc_path).lower() == 'gee':
+            try:
+                from serves_gee import download_lulc_raster
+            except ImportError:
+                print("  [WARN] earthengine-api not installed; "
+                      f"using scalar n={n_fallback}")
+                return np.full(n_cells, n_fallback, dtype=np.float64)
+
+            output_dir = getattr(cfg, 'OUTPUT_DIR', 'output/')
+            cached = os.path.join(output_dir, 'lulc_mannings.tif')
+            result = download_lulc_raster(
+                dem_path=dem_path,
+                watershed_geojson_path=getattr(
+                    cfg, 'OPM_WATERSHED_GEOJSON', 'output/watershed.geojson'),
+                output_path=cached,
+                project=getattr(cfg, 'GEE_PROJECT', None),
+            )
+            if result is None:
+                print("  [WARN] GEE LULC download failed; "
+                      f"using scalar n={n_fallback}")
+                return np.full(n_cells, n_fallback, dtype=np.float64)
+            lulc_2d = align_raster_to_dem(cached, dem_path,
+                                          resampling='nearest')
+        else:
+            if not os.path.isfile(lulc_path):
+                raise FileNotFoundError(
+                    f"MANNINGS_N_LULC_PATH not found: {lulc_path}"
+                )
+            lulc_2d = align_raster_to_dem(lulc_path, dem_path,
+                                          resampling='nearest')
+
+        csv_path = getattr(cfg, 'LULC_LOOKUP_CSV', 'lulc_lookup.csv')
+        lut = pd.read_csv(csv_path)
+        code_to_n = dict(zip(lut['class_code'].astype(int),
+                             lut['mannings_n'].astype(float)))
+        lulc_1d = lulc_2d[s_rows, s_cols]
+        n_1d = np.full(n_cells, n_fallback, dtype=np.float64)
+        for code, nval in code_to_n.items():
+            n_1d[lulc_1d == code] = nval
+
+    # ── Source: WUDAPT Local Climate Zones ───────────────────────────────
+    elif source == 'lcz':
+        try:
+            from serves_gee import download_lcz_raster
+        except ImportError:
+            print("  [WARN] earthengine-api not installed; "
+                  f"using scalar n={n_fallback}")
+            return np.full(n_cells, n_fallback, dtype=np.float64)
+
+        output_dir = getattr(cfg, 'OUTPUT_DIR', 'output/')
+        cached = os.path.join(output_dir, 'lulc_mannings_lcz.tif')
+        dem_path = cfg.ROUTING_DEM_PATH
+        result = download_lcz_raster(
+            dem_path=dem_path,
+            watershed_geojson_path=getattr(
+                cfg, 'OPM_WATERSHED_GEOJSON', 'output/watershed.geojson'),
+            output_path=cached,
+            project=getattr(cfg, 'GEE_PROJECT', None),
+        )
+        if result is None:
+            print("  [WARN] GEE LCZ download failed; "
+                  f"using scalar n={n_fallback}")
+            return np.full(n_cells, n_fallback, dtype=np.float64)
+
+        lcz_2d = align_raster_to_dem(cached, dem_path, resampling='nearest')
+        csv_path = getattr(cfg, 'LCZ_LOOKUP_CSV', 'lcz_lookup.csv')
+        lut = pd.read_csv(csv_path)
+        code_to_n = dict(zip(lut['class_code'].astype(int),
+                             lut['mannings_n'].astype(float)))
+        lulc_1d = lcz_2d[s_rows, s_cols]
+        n_1d = np.full(n_cells, n_fallback, dtype=np.float64)
+        for code, nval in code_to_n.items():
+            n_1d[lulc_1d == code] = nval
+
+    else:
+        raise ValueError(f"Unknown MANNINGS_N_SOURCE: '{source}'")
+
+    # ── Channel override (all modes) ─────────────────────────────────────
+    n_channel_cfg = getattr(cfg, 'MANNINGS_N_CHANNEL', None)
+    if n_channel_cfg is not None:
+        faccum_1d = grid_data['faccum_1d']
+        fa = faccum_1d.get() if hasattr(faccum_1d, 'get') else np.asarray(
+            faccum_1d)
+        threshold = getattr(cfg, 'CHANNEL_FACCUM_THRESHOLD', None)
+        if threshold is None:
+            threshold = max(1, n_cells // 100)
+        channel_mask = fa > threshold
+
+        if isinstance(n_channel_cfg, dict):
+            ds_idx = grid_data['ds_idx']
+            ds_np = ds_idx.get() if hasattr(ds_idx, 'get') else np.asarray(
+                ds_idx)
+            strahler = compute_strahler_order(ds_np, n_cells)
+            max_order = max(n_channel_cfg.keys())
+            for ci in np.where(channel_mask)[0]:
+                so = min(int(strahler[ci]), max_order)
+                n_1d[ci] = n_channel_cfg.get(so, n_channel_cfg[max_order])
+            order_dist = {o: int((strahler[channel_mask] == o).sum())
+                          for o in sorted(set(strahler[channel_mask]))}
+            print(f"  Manning's n   |  channel cells: "
+                  f"{int(channel_mask.sum()):,} / {n_cells:,}  "
+                  f"(threshold={threshold})")
+            print(f"  Manning's n   |  Strahler order distribution: "
+                  f"{order_dist}")
+        else:
+            n_1d[channel_mask] = float(n_channel_cfg)
+            print(f"  Manning's n   |  channel cells: "
+                  f"{int(channel_mask.sum()):,} / {n_cells:,}  "
+                  f"(threshold={threshold})")
+
+    print(f"  Manning's n   |  source={source}"
+          f"  range=[{n_1d.min():.4f}, {n_1d.max():.4f}]"
+          f"  mean={n_1d.mean():.4f}")
+    return n_1d
+
+
+# ---------------------------------------------------------------------------
+# 9.  Strahler stream order
+# ---------------------------------------------------------------------------
+
+def compute_strahler_order(ds_idx, n_cells):
+    """
+    Compute Strahler stream order for each cell.
+
+    Cells must be in topological order (upstream first).  Single O(n) pass:
+    headwater cells (no upstream) get order 1; when two streams of the same
+    order merge, the result is order + 1; otherwise the higher order continues.
+
+    Parameters
+    ----------
+    ds_idx  : (n_cells,) int array — downstream neighbour index (-1 = outlet)
+    n_cells : int
+
+    Returns
+    -------
+    order : (n_cells,) int array — Strahler order per cell
+    """
+    order     = np.ones(n_cells, dtype=np.int32)
+    max_order = np.zeros(n_cells, dtype=np.int32)
+    max_count = np.zeros(n_cells, dtype=np.int32)
+
+    for i in range(n_cells):
+        if max_order[i] == 0:
+            order[i] = 1
+        elif max_count[i] >= 2:
+            order[i] = max_order[i] + 1
+        else:
+            order[i] = max_order[i]
+
+        ds = int(ds_idx[i])
+        if ds >= 0:
+            if order[i] > max_order[ds]:
+                max_order[ds] = order[i]
+                max_count[ds] = 1
+            elif order[i] == max_order[ds]:
+                max_count[ds] += 1
+
+    return order

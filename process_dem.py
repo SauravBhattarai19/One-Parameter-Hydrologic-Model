@@ -17,10 +17,6 @@ from pysheds.grid import Grid
 # Suppress numba warnings from pysheds
 warnings.filterwarnings("ignore", message="The TBB threading layer requires TBB version")
 
-# Create output directory if it doesn't exist
-if not os.path.exists("output"):
-    os.makedirs("output")
-
 # Import configuration
 try:
     import config
@@ -34,6 +30,10 @@ except ImportError:
 except AttributeError as e:
     print(f"Error in config.py: {e}. Please ensure all required variables are defined.")
     exit()
+
+# Create the (scenario) output directory if it doesn't exist.  Driven by
+# config.OUTPUT_DIR so a new scenario folder is created automatically.
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def reproject_dem(input_dem_path, output_dem_path, target_crs_epsg):
     """

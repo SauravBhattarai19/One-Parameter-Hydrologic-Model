@@ -49,7 +49,12 @@ class OpmConfig:
     CELL_SIZE = None    # auto-detected from ROUTING_DEM_PATH
 
     # ── Manning's roughness ───────────────────────────────────────────────────
+    MANNINGS_N_SOURCE: str = "scalar"       # 'scalar' | 'lulc' | 'raster'
     MANNINGS_N: float = 0.09
+    MANNINGS_N_LULC_PATH: str = "gee"
+    MANNINGS_N_RASTER_PATH: str = None
+    MANNINGS_N_CHANNEL = {1: 0.10, 2: 0.06, 3: 0.045, 4: 0.035}
+    CHANNEL_FACCUM_THRESHOLD: int = None
 
     # ── Time stepping ────────────────────────────────────────────────────────
     TIME_STEP_SECONDS: int = 5
@@ -78,11 +83,11 @@ class OpmConfig:
     OPM_Q_MAX: float = 0.50
     OPM_PHI: float = 0.10              # drainable porosity (porosity − FC)
     OPM_K_SAT: float = 44.0
-    OPM_KSAT_SOURCE: str = "manual"        # 'manual' | 'gee'
     OPM_PER_POLYGON: bool = True
 
     # ── GEE / SERVES integration ──────────────────────────────────────────────
     OPM_SD_SOURCE: str = "manual"          # 'manual' | 'gee'
+    OPM_SD_REDUCER: str = "mean"          # 'max' | 'mean'
     LULC_LOOKUP_CSV: str = "lulc_lookup.csv"
     SERVES_TARGET_DATE: str = None
     SERVES_SATELLITE: str = "landsat"
