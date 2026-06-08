@@ -169,8 +169,15 @@ OPM_PER_POLYGON    = True
 #                  raster ÷ root-zone depth (no extra download).
 OPM_INFILTRATION = 'green_ampt'   # 'green_ampt' | 'none'
 
-# Wetting-front suction head ψ [m] for Green-Ampt (typical loam ≈ 0.1–0.2 m).
-OPM_GA_SUCTION_M = 0.15
+# Wetting-front suction head ψ [m] for Green-Ampt.
+# OPM_GA_SUCTION_SOURCE:
+#   'scalar'  → uniform OPM_GA_SUCTION_M below (typical loam ≈ 0.1–0.2 m).
+#   'texture' → per-cell ψ from SoilGrids sand/clay → USDA texture class →
+#               Rawls (1983) Green-Ampt suction table.  ψ enters GA only as the
+#               product ψ·Δθ₀, so this makes ψ spatial like Δθ₀.  Cells with no
+#               texture data fall back to OPM_GA_SUCTION_M.
+OPM_GA_SUCTION_SOURCE = 'texture'
+OPM_GA_SUCTION_M      = 0.15   # uniform value / nodata fallback [m]
 
 # Vertical surface infiltration capacity K_v [mm/hr] for Green-Ampt.
 #   IMPORTANT: this is the *vertical* (surface) saturated conductivity, NOT the

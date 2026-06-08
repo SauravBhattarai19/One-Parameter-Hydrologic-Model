@@ -221,6 +221,50 @@ def _raster_band_1d(raster_path, s_rows, s_cols):
     return arr2d[sr, sc]
 
 
+# Rawls, Brakensiek & Miller (1983) Green-Ampt wetting-front suction head [cm]
+# by USDA texture class.  (Silt → silt-loam value; Rawls has no silt class.)
+_RAWLS_PSI_CM = {
+    'sand': 4.95, 'loamy_sand': 6.13, 'sandy_loam': 11.01, 'loam': 8.89,
+    'silt_loam': 16.68, 'silt': 16.68, 'sandy_clay_loam': 21.85,
+    'clay_loam': 20.88, 'silty_clay_loam': 27.30, 'sandy_clay': 23.90,
+    'silty_clay': 29.22, 'clay': 31.63,
+}
+
+
+def _usda_psi_m(sand, clay):
+    """
+    Per-cell Green-Ampt suction ψ [m] from sand% / clay% via the USDA texture
+    triangle → Rawls (1983) table.  Vectorised (numpy).  `silt = 100−sand−clay`.
+    First-matching class wins (np.select), default = loam.
+    """
+    sand = np.asarray(sand, dtype=np.float64)
+    clay = np.asarray(clay, dtype=np.float64)
+    silt = 100.0 - sand - clay
+    P = _RAWLS_PSI_CM
+    conds = [
+        (clay >= 40) & (sand <= 45) & (silt < 40),                  # clay
+        (clay >= 40) & (silt >= 40),                                # silty clay
+        (clay >= 35) & (sand >= 45),                                # sandy clay
+        (clay >= 27) & (clay < 40) & (sand > 20) & (sand <= 45),    # clay loam
+        (clay >= 27) & (clay < 40) & (sand <= 20),                  # silty clay loam
+        (clay >= 20) & (clay < 35) & (silt < 28) & (sand > 45),     # sandy clay loam
+        (clay >= 7) & (clay < 27) & (silt >= 28) & (silt < 50) & (sand <= 52),  # loam
+        ((silt >= 50) & (clay >= 12) & (clay < 27))
+        | ((silt >= 50) & (silt < 80) & (clay < 12)),               # silt loam
+        (silt >= 80) & (clay < 12),                                 # silt
+        ((clay >= 7) & (clay < 20) & (sand > 52) & (silt + 2 * clay >= 30))
+        | ((clay < 7) & (silt < 50) & (silt + 2 * clay >= 30)),     # sandy loam
+        (silt + 1.5 * clay >= 15) & (silt + 1.5 * clay < 30),       # loamy sand
+        (silt + 1.5 * clay < 15),                                   # sand
+    ]
+    psi_cm = [
+        P['clay'], P['silty_clay'], P['sandy_clay'], P['clay_loam'],
+        P['silty_clay_loam'], P['sandy_clay_loam'], P['loam'], P['silt_loam'],
+        P['silt'], P['sandy_loam'], P['loamy_sand'], P['sand'],
+    ]
+    return np.select(conds, psi_cm, default=P['loam']) / 100.0   # cm → m
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 class RunoffEngine:
     """
@@ -559,7 +603,9 @@ class RunoffEngine:
         self._infiltration = getattr(cfg, 'OPM_INFILTRATION', 'none').lower()
         self._GA_F_FLOOR   = 1e-9        # m — floor on F so f_p is finite at F=0
         if self._infiltration == 'green_ampt':
-            self._ga_psi = float(getattr(cfg, 'OPM_GA_SUCTION_M', 0.15))
+            # Wetting-front suction ψ [m] per cell (scalar or SoilGrids texture).
+            psi_m = self._resolve_ga_psi_m(
+                cfg, grid_data, float(getattr(cfg, 'OPM_GA_SUCTION_M', 0.15)))
             # Vertical surface infiltration capacity (NOT the lateral OPM_K_SAT).
             kv_scalar = float(getattr(cfg, 'OPM_GA_KSAT_MMHR', 12.0))   # mm/hr
 
@@ -598,16 +644,16 @@ class RunoffEngine:
                 dtheta0_np[_bad] = _fallback
             dtheta0_np = np.clip(dtheta0_np, 0.0, 1.0)
 
+            self._ga_psi     = xp.asarray(psi_m)
             self._ga_ksat    = xp.asarray(kv_ms_1d)
             self._ga_dtheta0 = xp.asarray(dtheta0_np)
             self._ga_F       = xp.zeros(self._n_cells, dtype=np.float64)
             print(f"  Green-Ampt    |  K_v(mm/hr)=[{kv_mmhr.min():.2f}, "
                   f"{kv_mmhr.max():.2f}] mean={kv_mmhr.mean():.2f}"
-                  f"  psi={self._ga_psi} m"
-                  f"  dtheta0=[{dtheta0_np.min():.3f}, {dtheta0_np.max():.3f}]"
-                  f"  mean={dtheta0_np.mean():.3f}")
+                  f"  psi(m)=[{psi_m.min():.3f}, {psi_m.max():.3f}]"
+                  f"  dtheta0=[{dtheta0_np.min():.3f}, {dtheta0_np.max():.3f}]")
         else:
-            self._ga_ksat = self._ga_dtheta0 = self._ga_F = None
+            self._ga_psi = self._ga_ksat = self._ga_dtheta0 = self._ga_F = None
 
         # ── Per-polygon vs single-sandbox branching ───────────────────────────
         cell_polygon = grid_data.get('cell_polygon')
@@ -822,6 +868,57 @@ class RunoffEngine:
                   f"filled with median {fill:.2f} mm/hr")
         return kv
 
+    def _resolve_ga_psi_m(self, cfg, grid_data, psi_scalar):
+        """
+        Per-cell Green-Ampt suction ψ [m].
+
+          'scalar'  → uniform psi_scalar.
+          'texture' → SoilGrids sand/clay (2-band raster, DEM-aligned) → USDA
+                      class → Rawls (1983) ψ.  nodata cells fall back to psi_scalar.
+        """
+        n      = self._n_cells
+        source = getattr(cfg, 'OPM_GA_SUCTION_SOURCE', 'scalar').lower()
+        if source != 'texture':
+            return np.full(n, psi_scalar, dtype=np.float64)
+
+        path = getattr(cfg, 'OUTPUT_DIR', 'output/') + 'texture_sandclay.tif'
+        try:
+            from serves_gee import download_texture_raster
+            got = download_texture_raster(
+                dem_path=cfg.ROUTING_DEM_PATH,
+                watershed_geojson_path=getattr(
+                    cfg, 'OPM_WATERSHED_GEOJSON', 'output/watershed.geojson'),
+                output_path=path,
+                soil_depth_band=getattr(cfg, 'OPM_SOILGRIDS_DEPTH', 'b30'),
+                project=getattr(cfg, 'GEE_PROJECT', None))
+        except Exception as exc:
+            print(f"  [WARN] texture download failed ({exc}); scalar psi={psi_scalar} m")
+            got = None
+        if not got:
+            return np.full(n, psi_scalar, dtype=np.float64)
+
+        with rasterio.open(got) as src:
+            sand2d = src.read(1).astype(np.float64)
+            clay2d = src.read(2).astype(np.float64)
+            nodata = src.nodata
+        _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+        sr = _to_np(grid_data['s_rows']); sc = _to_np(grid_data['s_cols'])
+        if sr.max() >= sand2d.shape[0] or sc.max() >= sand2d.shape[1]:
+            print("  [WARN] texture raster grid ≠ routing grid; "
+                  f"scalar psi={psi_scalar} m")
+            return np.full(n, psi_scalar, dtype=np.float64)
+
+        sand = sand2d[sr, sc]; clay = clay2d[sr, sc]
+        bad = ~np.isfinite(sand) | ~np.isfinite(clay) | (sand + clay <= 0)
+        if nodata is not None:
+            bad |= (sand == nodata) | (clay == nodata)
+        psi = _usda_psi_m(np.clip(sand, 0, 100), np.clip(clay, 0, 100))
+        if bad.any():
+            psi[bad] = psi_scalar
+        print(f"  GA suction    |  psi(m)=[{psi.min():.3f}, {psi.max():.3f}] "
+              f"mean={psi.mean():.3f}  (texture/Rawls)")
+        return psi
+
     def _update_opm_sandbox(self, rain_1d, dt):
         """Advance OPM sandbox state by one timestep (dispatches to mode)."""
         if self._per_polygon:
@@ -855,7 +952,7 @@ class RunoffEngine:
         P_div = rain_1d[idx]
         if self._infiltration != 'green_ampt':
             return P_div
-        f_p = self._ga_ksat[idx] * (1.0 + self._ga_psi * self._ga_dtheta0[idx]
+        f_p = self._ga_ksat[idx] * (1.0 + self._ga_psi[idx] * self._ga_dtheta0[idx]
                                     / xp.maximum(self._ga_F[idx], self._GA_F_FLOOR))
         f_div = xp.minimum(P_div, f_p)
         return (1.0 - self._imperv_1d[idx]) * f_div
@@ -905,7 +1002,7 @@ class RunoffEngine:
             F_d  = float(self._ga_F[di])
             kv   = float(self._ga_ksat[di])
             dth0 = float(self._ga_dtheta0[di])
-            f_p  = kv * (1.0 + self._ga_psi * dth0 / max(F_d, self._GA_F_FLOOR))
+            f_p  = kv * (1.0 + float(self._ga_psi[di]) * dth0 / max(F_d, self._GA_F_FLOOR))
             f_div = (1.0 - float(self._imperv_1d[di])) * min(P_div, f_p)
         else:
             f_div = P_div

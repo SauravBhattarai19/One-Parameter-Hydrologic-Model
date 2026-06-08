@@ -55,6 +55,16 @@ _DEPTH_BANDS = {
     'b200': 'val_100_200cm_mean',
 }
 
+# SoilGrids texture (projects/soilgrids-isric/{sand,clay,silt}_mean) band suffixes.
+_TEXTURE_DEPTH = {
+    'b0':   '0-5cm_mean',
+    'b10':  '5-15cm_mean',
+    'b30':  '15-30cm_mean',
+    'b60':  '30-60cm_mean',
+    'b100': '60-100cm_mean',
+    'b200': '100-200cm_mean',
+}
+
 # SERVES coefficients (matches serves.js CONFIG)
 _NDVI_COEFFICIENT = 1.33
 _NDVI_INTERCEPT = -0.049
@@ -504,6 +514,62 @@ def download_ksat_raster(dem_path, watershed_geojson_path, output_path,
 
     except Exception as exc:
         logger.warning("GEE Ksat raster download failed: %s", exc)
+        return None
+
+
+def download_texture_raster(dem_path, watershed_geojson_path, output_path,
+                            soil_depth_band='b30', project=None):
+    """
+    Download a 2-band SoilGrids texture raster, pixel-aligned to the routing DEM:
+        band 1 = sand %,  band 2 = clay %   (stored g/kg → ×0.1 → %).
+    Used to derive the Green-Ampt wetting-front suction ψ per cell (USDA texture
+    class → Rawls 1983 table), classified client-side.  Cached to *output_path*.
+
+    Returns the output path on success, or None on failure.
+    """
+    if os.path.isfile(output_path):
+        logger.info("Texture raster cached: %s", output_path)
+        return output_path
+
+    if not GEE_AVAILABLE:
+        logger.warning("earthengine-api not installed")
+        return None
+
+    if not _authenticate(project):
+        return None
+
+    try:
+        import rasterio
+        import urllib.request
+
+        geometry = _load_watershed_geometry(watershed_geojson_path)
+        suf = _TEXTURE_DEPTH.get(soil_depth_band, '15-30cm_mean')
+        sand = ee.Image('projects/soilgrids-isric/sand_mean') \
+            .select(f'sand_{suf}').multiply(0.1).rename('sand_pct')
+        clay = ee.Image('projects/soilgrids-isric/clay_mean') \
+            .select(f'clay_{suf}').multiply(0.1).rename('clay_pct')
+        img = sand.addBands(clay)
+
+        with rasterio.open(dem_path) as dem:
+            crs = str(dem.crs)
+            t = dem.transform
+            crs_transform = [t.a, t.b, t.c, t.d, t.e, t.f]
+            dimensions = [dem.width, dem.height]
+
+        url = img.clip(geometry).getDownloadURL({
+            'crs': crs,
+            'crs_transform': crs_transform,
+            'dimensions': dimensions,
+            'format': 'GEO_TIFF',
+        })
+
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        urllib.request.urlretrieve(url, output_path)
+        logger.info("Texture raster downloaded: %s", output_path)
+        return output_path
+
+    except Exception as exc:
+        logger.warning("GEE texture raster download failed: %s", exc)
         return None
 
 
