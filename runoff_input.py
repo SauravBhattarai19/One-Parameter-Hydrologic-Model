@@ -29,6 +29,8 @@ import pandas as pd
 import rasterio
 import os
 
+import gpu_utils
+
 # ── OPM physical constants (Pradhan & Ogden 2010) ────────────────────────────
 _OPM_SD_MIN = 0.001          # m   minimum saturation deficit
 _OPM_Q_MIN  = 0.001          # m³/s  minimum discharge (Eq 10)
@@ -198,6 +200,26 @@ def _per_zone_sd_from_raster(deficit_path, cell_polygon, n_polygons,
     return np.maximum(sd, sd_min)
 
 
+def _deficit_1d_from_raster(deficit_path, s_rows, s_cols):
+    """
+    Per-cell SERVES deficit [(porosity−θ)·Z_r, in m] over the routing grid.
+
+    Returns (n_cells,) float64 with nodata/out-of-grid cells set to NaN, or
+    None if the raster grid does not match the routing grid.
+    """
+    with rasterio.open(deficit_path) as src:
+        deficit2d = src.read(1).astype(np.float64)
+        nodata    = src.nodata
+    if nodata is not None:
+        deficit2d[deficit2d == nodata] = np.nan
+
+    _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+    sr = _to_np(s_rows); sc = _to_np(s_cols)
+    if sr.max() >= deficit2d.shape[0] or sc.max() >= deficit2d.shape[1]:
+        return None
+    return deficit2d[sr, sc]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 class RunoffEngine:
     """
@@ -278,7 +300,34 @@ class RunoffEngine:
         elif self._mode == 'scs_cn':
             return self._get_scs_rate()
         elif self._mode == 'vsa_opm':
-            return rain_1d * self._vsa_mask.astype(np.float64)
+            return self._opm_effective_runoff(rain_1d)
+
+    def _opm_effective_runoff(self, rain_1d):
+        """
+        Unified per-cell effective runoff [m/s] for vsa_opm mode:
+
+            runoff = rain · [ Imp + (1 − Imp) · max(in_VSA, infil_excess_frac) ]
+
+        - Impervious fraction Imp always sheds rain (urban contributes regardless
+          of A_t).
+        - Pervious fraction sheds rain if the cell is in the VSA (saturation
+          excess) OR rainfall beats the Green-Ampt infiltration capacity
+          (Hortonian / infiltration excess).  `max` caps shedding at 100 % of rain.
+        With OPM_INFILTRATION='none' and no impervious layer this reduces exactly
+        to the original `rain · in_VSA`.
+        """
+        xp = self._xp
+        if self._infiltration == 'green_ampt':
+            f_p = self._ga_ksat * (1.0 + self._ga_psi * self._ga_dtheta0
+                                   / xp.maximum(self._ga_F, self._GA_F_FLOOR))
+            excess      = xp.maximum(rain_1d - f_p, 0.0)
+            excess_frac = xp.where(rain_1d > 0.0,
+                                   excess / xp.maximum(rain_1d, 1e-30), 0.0)
+        else:
+            excess_frac = 0.0
+        pervious_frac = xp.where(self._vsa_mask, 1.0, excess_frac)
+        return rain_1d * (self._imperv_1d
+                          + (1.0 - self._imperv_1d) * pervious_frac)
 
     def get_effective_2d(self, t_seconds, rain_1d):
         """
@@ -295,7 +344,11 @@ class RunoffEngine:
         if self._mode == 'none':
             return False
         if self._mode == 'vsa_opm':
-            return bool(self._vsa_mask.any())
+            # Runoff can come from the VSA, impervious cells, or Green-Ampt
+            # infiltration-excess — any of which makes the engine "active".
+            return (bool(self._vsa_mask.any())
+                    or bool((self._imperv_1d > 0).any())
+                    or self._infiltration == 'green_ampt')
         if self._mode == 'coefficient':
             return bool((self._Cf_1d > 0).any())
         if self._mode == 'raster':
@@ -490,6 +543,66 @@ class RunoffEngine:
         # Extensibility hook: records which A_t initialisation method was used.
         self._at_method = 'single_measurement'
 
+        # ── Backend (numpy / cupy) for the vectorised hot path ────────────────
+        # _upslope_area is already CuPy in GPU mode (built from CuPy faccum_1d),
+        # so get_xp picks the right module for every per-cell/per-zone op below.
+        self._xp = gpu_utils.get_xp(self._upslope_area)
+        xp = self._xp
+
+        # ── Impervious fraction (urban areas shed rain regardless of A_t) ─────
+        import routing_utils as _ru
+        imperv_np = _ru.resolve_impervious_fraction(cfg, grid_data)   # (n_cells,)
+        self._imperv_1d = xp.asarray(imperv_np)
+
+        # ── Green-Ampt per-cell infiltration setup ────────────────────────────
+        self._infiltration = getattr(cfg, 'OPM_INFILTRATION', 'none').lower()
+        self._GA_F_FLOOR   = 1e-9        # m — floor on F so f_p is finite at F=0
+        if self._infiltration == 'green_ampt':
+            self._ga_psi = float(getattr(cfg, 'OPM_GA_SUCTION_M', 0.15))
+            # Vertical surface infiltration capacity (NOT the lateral OPM_K_SAT).
+            kv_ms = float(getattr(cfg, 'OPM_GA_KSAT_MMHR', 12.0)) / 1000.0 / 3600.0
+
+            s_rows = grid_data['s_rows']
+            s_cols = grid_data['s_cols']
+
+            # Root-zone depth Z_r per cell from the SAME land-cover source that
+            # built the SERVES deficit raster, so Δθ₀ = deficit / Z_r is consistent.
+            _n_source = getattr(cfg, 'MANNINGS_N_SOURCE', 'lulc').lower()
+            _lc_src   = 'lcz' if _n_source == 'lcz' else 'lulc'
+            zr_default = float(getattr(cfg, 'OPM_SD_MAX_INITIAL', 0.5)) or 0.5
+            zr_np = np.maximum(
+                _ru.resolve_lulc_field(cfg, grid_data, 'root_zone_depth_m',
+                                       zr_default, _lc_src), 1e-3)
+
+            # Δθ₀ = initial moisture deficit (porosity − θ) per cell.
+            #   From the SERVES deficit raster: Δθ₀ = deficit / Z_r.
+            #   Fallback (no raster / nodata): watershed-scalar SD_max ÷ mean Z_r.
+            _fallback = float(SD_max_initial) / float(zr_np.mean())
+            dtheta0_np = None
+            deficit_raster = params.get('deficit_raster')
+            if deficit_raster:
+                dfc = _deficit_1d_from_raster(deficit_raster, s_rows, s_cols)
+                if dfc is not None:
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        dtheta0_np = dfc / zr_np
+            if dtheta0_np is None:
+                dtheta0_np = np.full(self._n_cells, _fallback, dtype=np.float64)
+            _bad = ~np.isfinite(dtheta0_np)
+            if _bad.any():
+                dtheta0_np[_bad] = _fallback
+            dtheta0_np = np.clip(dtheta0_np, 0.0, 1.0)
+
+            self._ga_ksat    = xp.asarray(
+                np.full(self._n_cells, kv_ms, dtype=np.float64))
+            self._ga_dtheta0 = xp.asarray(dtheta0_np)
+            self._ga_F       = xp.zeros(self._n_cells, dtype=np.float64)
+            print(f"  Green-Ampt    |  K_v={kv_ms*1000*3600:.1f} mm/hr"
+                  f"  psi={self._ga_psi} m"
+                  f"  dtheta0=[{dtheta0_np.min():.3f}, {dtheta0_np.max():.3f}]"
+                  f"  mean={dtheta0_np.mean():.3f}")
+        else:
+            self._ga_ksat = self._ga_dtheta0 = self._ga_F = None
+
         # ── Per-polygon vs single-sandbox branching ───────────────────────────
         cell_polygon = grid_data.get('cell_polygon')
         use_per_polygon = getattr(cfg, 'OPM_PER_POLYGON', True)
@@ -594,6 +707,18 @@ class RunoffEngine:
             print(f"                |  Per-polygon mode: {n_polygons} zones")
             print(f"                |  Initial VSA={self._vsa_mask.sum():,} cells"
                   f" ({100*self._vsa_mask.mean():.1f}% of watershed)")
+
+            # Move per-zone state + indices onto the active backend so the
+            # vectorised sandbox update runs entirely in numpy OR cupy.
+            self._cell_polygon         = xp.asarray(cell_polygon)
+            self._polygon_divide_idx   = xp.asarray(divide_idx)
+            self._polygon_slope_divide = xp.asarray(slope_divide)
+            self._SD_max_initial       = xp.asarray(sd_init_arr)
+            self._ksat_ms              = xp.asarray(self._ksat_ms)
+            self._opm_H_a              = xp.asarray(H_a_arr)
+            self._opm_z                = xp.asarray(self._opm_z)
+            self._opm_SD_max           = xp.asarray(self._opm_SD_max)
+            self._opm_A_t              = xp.asarray(self._opm_A_t)
         else:
             # ── Single-sandbox mode (uniform rainfall) ────────────────────────
             self._per_polygon  = False
@@ -608,6 +733,7 @@ class RunoffEngine:
             elev = dem[s_rows[candidates], s_cols[candidates]]
             divide_cell = candidates[elev.argmax()]
             self._slope_divide = float(slope_np[divide_cell])
+            self._divide_cell  = int(divide_cell)
 
             self._SD_max_initial = SD_max_initial  # scalar
             Rf_init = sd_min / SD_max_initial
@@ -636,17 +762,90 @@ class RunoffEngine:
             self._update_opm_sandbox_per_polygon(rain_1d, dt)
         else:
             self._update_opm_sandbox_single(rain_1d, dt)
+        # Advance per-cell Green-Ampt cumulative infiltration AFTER the sandbox
+        # has used the current-step F (forward Euler — matches get_effective_1d).
+        self._update_ga_F(rain_1d, dt)
+
+    def _update_ga_F(self, rain_1d, dt):
+        """Advance per-cell Green-Ampt cumulative infiltration F [m]."""
+        if self._infiltration != 'green_ampt':
+            return
+        xp  = self._xp
+        f_p = self._ga_ksat * (1.0 + self._ga_psi * self._ga_dtheta0
+                               / xp.maximum(self._ga_F, self._GA_F_FLOOR))
+        f = xp.minimum(rain_1d, f_p)          # infiltration rate on pervious soil
+        self._ga_F = self._ga_F + f * dt
+
+    def _divide_infiltration(self, rain_1d):
+        """
+        Effective infiltration rate [m/s] feeding each zone's sandbox at its
+        divide cell.  With Green-Ampt, rainfall is capped by the local
+        infiltration capacity and scaled by the pervious fraction (the
+        impervious fraction sheds water and does not recharge the water table).
+        Returns a (n_polygons,) array indexed by polygon_divide_idx.
+        """
+        xp    = self._xp
+        idx   = self._polygon_divide_idx
+        P_div = rain_1d[idx]
+        if self._infiltration != 'green_ampt':
+            return P_div
+        f_p = self._ga_ksat[idx] * (1.0 + self._ga_psi * self._ga_dtheta0[idx]
+                                    / xp.maximum(self._ga_F[idx], self._GA_F_FLOOR))
+        f_div = xp.minimum(P_div, f_p)
+        return (1.0 - self._imperv_1d[idx]) * f_div
+
+    def _update_opm_sandbox_per_polygon(self, rain_1d, dt):
+        """
+        Per-polygon sandbox update — fully vectorised over zones (numpy / cupy).
+
+        Each precipitation zone has its own divide cell, saturated-zone thickness
+        z[p], SD_max[p] and threshold area A_t[p].  Only the *infiltrated* depth
+        at the divide raises z (Green-Ampt); the VSA mask is then rebuilt from
+        per-cell polygon assignments.
+        """
+        xp    = self._xp
+        f_div = self._divide_infiltration(rain_1d)             # (n_polygons,)
+
+        q_b = (self._ksat_ms * self._polygon_slope_divide
+               * self._opm_z * self._cell_size)
+        dV  = (f_div * self._cell_area - q_b) * dt
+        dz  = dV / (self._cell_area * self._phi)
+        self._opm_z = xp.maximum(0.0, self._opm_z + dz)
+
+        self._opm_SD_max = xp.maximum(self._sd_min,
+                                      self._SD_max_initial - self._opm_z)
+
+        Rf_t  = self._sd_min / self._opm_SD_max
+        denom = self._opm_H_a - xp.log(Rf_t)
+        # Guard the near-zero denominator before dividing (xp.where evaluates
+        # both branches, so the divisor must be finite even where unused).
+        denom_safe = xp.where(xp.abs(denom) < 1e-12, 1.0, denom)
+        new_A_t    = xp.where(xp.abs(denom) < 1e-12, self._opm_A_t_init,
+                              self._opm_H_a * self._opm_A_1 / denom_safe)
+        self._opm_A_t = xp.clip(new_A_t, self._opm_A_1, self._opm_A_outlet)
+
+        # Vectorised VSA mask rebuild: each cell uses its polygon's A_t
+        A_t_per_cell   = self._opm_A_t[self._cell_polygon]
+        self._vsa_mask = self._upslope_area > A_t_per_cell
 
     def _update_opm_sandbox_single(self, rain_1d, dt):
         """
-        Single-sandbox update (original Pradhan & Ogden 2010, Eq 12).
-
-        Rainfall at the catchment divide (index 0) drives the water balance.
+        Single-sandbox update (original Pradhan & Ogden 2010, Eq 12), with
+        optional Green-Ampt limiting of the divide-cell infiltration.
         """
-        P_divide = float(rain_1d[0])
+        di    = self._divide_cell
+        P_div = float(rain_1d[di])
+        if self._infiltration == 'green_ampt':
+            F_d  = float(self._ga_F[di])
+            kv   = float(self._ga_ksat[di])
+            dth0 = float(self._ga_dtheta0[di])
+            f_p  = kv * (1.0 + self._ga_psi * dth0 / max(F_d, self._GA_F_FLOOR))
+            f_div = (1.0 - float(self._imperv_1d[di])) * min(P_div, f_p)
+        else:
+            f_div = P_div
 
         q_b = self._ksat_ms * self._slope_divide * self._opm_z * self._cell_size
-        dV  = (P_divide * self._cell_area - q_b) * dt
+        dV  = (f_div * self._cell_area - q_b) * dt
         dz  = dV / (self._cell_area * self._phi)
         self._opm_z = max(0.0, self._opm_z + dz)
 
@@ -661,38 +860,3 @@ class RunoffEngine:
 
         self._opm_A_t = float(np.clip(new_A_t, self._opm_A_1, self._opm_A_outlet))
         self._vsa_mask = self._upslope_area > self._opm_A_t
-
-    def _update_opm_sandbox_per_polygon(self, rain_1d, dt):
-        """
-        Per-polygon sandbox update.
-
-        Each precipitation zone has its own divide cell, saturated zone
-        thickness z[p], SD_max[p], and threshold area A_t[p].  The VSA mask
-        is rebuilt from per-cell polygon assignments after all zones update.
-        """
-        for p in range(self._n_polygons):
-            P_div = float(rain_1d[self._polygon_divide_idx[p]])
-
-            z_p = self._opm_z[p]
-            q_b = self._ksat_ms[p] * self._polygon_slope_divide[p] * z_p * self._cell_size
-            dV  = (P_div * self._cell_area - q_b) * dt
-            dz  = dV / (self._cell_area * self._phi)
-            z_p = max(0.0, z_p + dz)
-            self._opm_z[p] = z_p
-
-            SD_max_p = max(self._sd_min, self._SD_max_initial[p] - z_p)
-            self._opm_SD_max[p] = SD_max_p
-
-            Rf_t  = self._sd_min / SD_max_p
-            H_a_p = self._opm_H_a[p]
-            denom = H_a_p - np.log(Rf_t)
-            if abs(denom) < 1e-12:
-                self._opm_A_t[p] = self._opm_A_t_init
-            else:
-                new_A_t = H_a_p * self._opm_A_1 / denom
-                self._opm_A_t[p] = float(np.clip(new_A_t, self._opm_A_1,
-                                                  self._opm_A_outlet))
-
-        # Vectorised VSA mask rebuild: each cell uses its polygon's A_t
-        A_t_per_cell   = self._opm_A_t[self._cell_polygon]
-        self._vsa_mask = self._upslope_area > A_t_per_cell

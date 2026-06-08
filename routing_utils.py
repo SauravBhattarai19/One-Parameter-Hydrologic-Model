@@ -535,6 +535,136 @@ def resolve_mannings_n(cfg, grid_data):
 
 
 # ---------------------------------------------------------------------------
+# 8b. Per-cell land-cover field lookup (impervious fraction, root depth, …)
+# ---------------------------------------------------------------------------
+
+def _lulc_class_1d(cfg, grid_data, source):
+    """
+    Per-cell land-cover class codes from the cached LCZ/LULC raster.
+
+    Reuses the SAME cache file as ``resolve_mannings_n``
+    (``lulc_mannings_lcz.tif`` / ``lulc_mannings.tif``) so no extra GEE download
+    happens when Manning's n already pulled the layer.
+
+    Returns
+    -------
+    (class_1d, lookup_csv_path) : (n_cells,) int-ish array + CSV path,
+        or (None, None) when the raster is unavailable.
+    """
+    import os
+
+    s_rows = grid_data['s_rows']
+    s_cols = grid_data['s_cols']
+    dem_path   = cfg.ROUTING_DEM_PATH
+    output_dir = getattr(cfg, 'OUTPUT_DIR', 'output/')
+    geojson    = getattr(cfg, 'OPM_WATERSHED_GEOJSON', 'output/watershed.geojson')
+    project    = getattr(cfg, 'GEE_PROJECT', None)
+
+    if source == 'lcz':
+        try:
+            from serves_gee import download_lcz_raster
+        except ImportError:
+            return None, None
+        cached = os.path.join(output_dir, 'lulc_mannings_lcz.tif')
+        result = download_lcz_raster(dem_path=dem_path,
+                                     watershed_geojson_path=geojson,
+                                     output_path=cached, project=project)
+        csv_path = getattr(cfg, 'LCZ_LOOKUP_CSV', 'lcz_lookup.csv')
+    else:
+        try:
+            from serves_gee import download_lulc_raster
+        except ImportError:
+            return None, None
+        cached = os.path.join(output_dir, 'lulc_mannings.tif')
+        result = download_lulc_raster(dem_path=dem_path,
+                                      watershed_geojson_path=geojson,
+                                      output_path=cached, project=project)
+        csv_path = getattr(cfg, 'LULC_LOOKUP_CSV', 'lulc_lookup.csv')
+
+    if result is None:
+        return None, None
+
+    arr2d = align_raster_to_dem(cached, dem_path, resampling='nearest')
+    _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+    return arr2d[_to_np(s_rows), _to_np(s_cols)], csv_path
+
+
+def resolve_lulc_field(cfg, grid_data, column, default, source):
+    """
+    Build a per-cell field by remapping land-cover class codes through *column*
+    of the LCZ/LULC lookup CSV.  Used for impervious fraction and root-zone
+    depth.  Cells with an unmapped class (or when the raster/column is missing)
+    get *default*.  Returns (n_cells,) float64.
+    """
+    import pandas as pd
+
+    n_cells = len(grid_data['s_rows'])
+    class_1d, csv_path = _lulc_class_1d(cfg, grid_data, source)
+    if class_1d is None:
+        print(f"  [WARN] {source} raster unavailable; "
+              f"'{column}' → {default} everywhere")
+        return np.full(n_cells, float(default), dtype=np.float64)
+
+    lut = pd.read_csv(csv_path)
+    if column not in lut.columns:
+        print(f"  [WARN] column '{column}' missing from {csv_path}; "
+              f"using {default} everywhere")
+        return np.full(n_cells, float(default), dtype=np.float64)
+
+    code_to_v = dict(zip(lut['class_code'].astype(int),
+                         lut[column].astype(float)))
+    out = np.full(n_cells, float(default), dtype=np.float64)
+    for code, v in code_to_v.items():
+        out[class_1d == code] = v
+    return out
+
+
+def resolve_impervious_fraction(cfg, grid_data):
+    """
+    Per-cell impervious fraction Imp ∈ [0,1] from ``IMPERVIOUS_SOURCE``.
+
+      'lcz' / 'lulc' → impervious_fraction column of the matching lookup CSV
+      'raster'       → continuous GeoTIFF at IMPERVIOUS_RASTER_PATH (bilinear)
+      'none'         → zeros
+
+    Returns (n_cells,) float64, clipped to [0,1].
+    """
+    import os
+
+    source  = getattr(cfg, 'IMPERVIOUS_SOURCE', 'none').lower()
+    n_cells = len(grid_data['s_rows'])
+    s_rows  = grid_data['s_rows']
+    s_cols  = grid_data['s_cols']
+
+    if source == 'none':
+        return np.zeros(n_cells, dtype=np.float64)
+
+    if source == 'raster':
+        path = getattr(cfg, 'IMPERVIOUS_RASTER_PATH', None)
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"IMPERVIOUS_SOURCE='raster' but IMPERVIOUS_RASTER_PATH "
+                f"not found: {path}"
+            )
+        arr2d = align_raster_to_dem(path, cfg.ROUTING_DEM_PATH,
+                                    resampling='bilinear')
+        _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+        imp = arr2d[_to_np(s_rows), _to_np(s_cols)].astype(np.float64)
+        imp[~np.isfinite(imp)] = 0.0
+    elif source in ('lcz', 'lulc'):
+        imp = resolve_lulc_field(cfg, grid_data, 'impervious_fraction',
+                                 0.0, source)
+    else:
+        raise ValueError(f"Unknown IMPERVIOUS_SOURCE: '{source}'")
+
+    imp = np.clip(imp, 0.0, 1.0)
+    print(f"  Impervious    |  source={source}"
+          f"  range=[{imp.min():.2f}, {imp.max():.2f}]"
+          f"  mean={imp.mean():.2f}  (>0: {int((imp > 0).sum()):,}/{n_cells:,} cells)")
+    return imp
+
+
+# ---------------------------------------------------------------------------
 # 9.  Strahler stream order
 # ---------------------------------------------------------------------------
 

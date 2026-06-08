@@ -158,6 +158,46 @@ OPM_K_SAT          = 44.0   # m/day  (calibrated)
 # OPM_PER_POLYGON: each gauge zone gets its own OPM sandbox (z, SD_max, A_t).
 OPM_PER_POLYGON    = True
 
+# ── Infiltration model (Green-Ampt) ──────────────────────────────────────────
+# Adds an infiltration limit on top of the VSA saturation-excess mechanism.
+#   'none'       → original behaviour: ALL rain infiltrates the sandbox; runoff is
+#                  pure saturation-excess (cells in the VSA shed all rain).
+#   'green_ampt' → per-cell Green-Ampt infiltration capacity f_p = K·(1 + ψ·Δθ₀/F).
+#                  Infiltration-excess (rain − f_p) becomes Hortonian runoff, and at
+#                  each zone's divide the *infiltrated* depth (not all rain) drives the
+#                  sandbox z → SD_max(t) → A_t.  Δθ₀ is derived from the SERVES deficit
+#                  raster ÷ root-zone depth (no extra download).
+OPM_INFILTRATION = 'green_ampt'   # 'green_ampt' | 'none'
+
+# Wetting-front suction head ψ [m] for Green-Ampt (typical loam ≈ 0.1–0.2 m).
+OPM_GA_SUCTION_M = 0.15
+
+# Vertical surface infiltration capacity K_v [mm/hr] for Green-Ampt.
+#   IMPORTANT: this is the *vertical* (surface) saturated conductivity, NOT the
+#   lateral transmissivity OPM_K_SAT (44 m/day) that drives the sandbox Darcy
+#   drainage.  Vertical Ksat is far smaller (sand ≈ 50, loam ≈ 10, clay ≈ 1 mm/hr);
+#   using the lateral value here would make f_p ≫ rain and Green-Ampt would never
+#   generate infiltration-excess runoff.
+OPM_GA_KSAT_MMHR = 12.0
+
+# ── Impervious fraction (urban areas shed rain regardless of the VSA) ─────────
+# Per-cell impervious fraction Imp ∈ [0,1].  Effective runoff per cell is
+#   rain · [ Imp + (1 − Imp) · max(in_VSA, infiltration_excess_fraction) ]
+# so urbanised cells contribute even when their upslope area is below A_t.
+#   'lcz'    → impervious_fraction column of LCZ_LOOKUP_CSV (reuses cached LCZ raster)
+#   'lulc'   → impervious_fraction column of LULC_LOOKUP_CSV (ESA WorldCover)
+#   'raster' → pre-computed continuous impervious-fraction GeoTIFF (IMPERVIOUS_RASTER_PATH)
+#   'none'   → no impervious contribution (Imp = 0 everywhere)
+IMPERVIOUS_SOURCE      = 'lcz'
+IMPERVIOUS_RASTER_PATH = None
+
+# ── Baseflow ──────────────────────────────────────────────────────────────────
+# OPM_BASEFLOW: seed every cell with the steady pre-storm discharge implied by
+#   OPM_Q_MAX so the outlet hydrograph starts at baseflow instead of zero, making
+#   simulated hydrographs directly comparable to observed (gauged) discharge.
+#   False → hydrograph starts at 0 (original behaviour).
+OPM_BASEFLOW = True
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6.  SERVES / GEE SOIL-MOISTURE DEFICIT  (SD_max & phi from satellite)

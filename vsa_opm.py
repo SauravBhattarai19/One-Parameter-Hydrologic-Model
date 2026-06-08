@@ -119,7 +119,7 @@ def run_opm(cfg):
     SD_max_initial  = params['sd_max']
     sd_min          = params['sd_min']
     phi             = params['phi']
-    sd_max_per_poly = params['sd_max_per_polygon']
+    deficit_raster  = params['deficit_raster']
     K_MS            = params['ksat_ms']
     Q_max = float(cfg.OPM_Q_MAX)
 
@@ -170,10 +170,16 @@ def run_opm(cfg):
             poly_divide_idx[p]   = best
             poly_slope_divide[p] = float(slope_1d[best])
 
-        # Per-polygon SD_max_initial and H_a
-        if (sd_max_per_poly is not None
-                and len(sd_max_per_poly) == n_polygons):
-            sd_init_arr = np.array(sd_max_per_poly, dtype=np.float64)
+        # Per-zone SD_max from the deficit raster over each zone's own watershed
+        # cells — the SAME path as the production engine
+        # (runoff_input._init_vsa_opm), so this diagnostic matches the real run
+        # instead of falling back to a uniform watershed SD_max.
+        reducer = getattr(cfg, 'OPM_SD_REDUCER', 'mean').lower()
+        if deficit_raster:
+            from runoff_input import _per_zone_sd_from_raster
+            sd_init_arr = _per_zone_sd_from_raster(
+                deficit_raster, cell_polygon, n_polygons,
+                s_rows, s_cols, reducer, sd_min, SD_max_initial)
         else:
             sd_init_arr = np.full(n_polygons, SD_max_initial, dtype=np.float64)
 

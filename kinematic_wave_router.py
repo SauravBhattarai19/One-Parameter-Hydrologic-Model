@@ -211,6 +211,15 @@ def run_time_loop(grid_data, cfg):
 
     hydrograph = []  # list of (time_seconds, Q_m3s) — Python floats
 
+    # Baseflow offset: add the steady pre-storm discharge (OPM_Q_MAX) so the
+    # reported outlet hydrograph starts at baseflow instead of zero, making it
+    # directly comparable to observed (gauged) discharge.  Pure additive offset
+    # on the routed stormflow — does not affect routing/runoff generation.
+    q_base = (float(getattr(cfg, 'OPM_Q_MAX', 0.0))
+              if getattr(cfg, 'OPM_BASEFLOW', False) else 0.0)
+    if q_base:
+        print(f"  Baseflow offset added to outlet: {q_base:.3f} m³/s")
+
     print("=" * 60)
     print(f"TIME LOOP  |  steps={n_steps:,}  dt={dt}s  "
           f"sim={cfg.TOTAL_SIMULATION_TIME_HOURS}h")
@@ -304,7 +313,7 @@ def run_time_loop(grid_data, cfg):
         )
         if _need_q:
             # .item() converts CuPy 0-d → Python float (8-byte D→H); no-op on NumPy.
-            Q_outlet = float(Q_out_1d[outlet_pos].item())
+            Q_outlet = float(Q_out_1d[outlet_pos].item()) + q_base
 
         if (step + 1) % write_every == 0 or step == n_steps - 1:
             hydrograph.append((t_seconds + dt, Q_outlet))
