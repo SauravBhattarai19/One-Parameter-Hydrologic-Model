@@ -178,7 +178,19 @@ OPM_GA_SUCTION_M = 0.15
 #   drainage.  Vertical Ksat is far smaller (sand ≈ 50, loam ≈ 10, clay ≈ 1 mm/hr);
 #   using the lateral value here would make f_p ≫ rain and Green-Ampt would never
 #   generate infiltration-excess runoff.
-OPM_GA_KSAT_MMHR = 12.0
+#
+# OPM_GA_KSAT_SOURCE:
+#   'scalar' → uniform OPM_GA_KSAT_MMHR below.
+#   'gee'    → per-cell HiHydroSoil v2.0 Ksat (vertical saturated conductivity),
+#              downloaded aligned to the routing DEM and cached to
+#              OPM_GA_KSAT_RASTER.  Cells with no data fall back to OPM_GA_KSAT_MMHR.
+#   'raster' → pre-computed mm/hr GeoTIFF at OPM_GA_KSAT_RASTER.
+OPM_GA_KSAT_SOURCE = 'gee'
+OPM_GA_KSAT_MMHR   = 12.0    # uniform value / nodata fallback [mm/hr]
+OPM_GA_KSAT_RASTER = None    # None → auto-path: {OUTPUT_DIR}/ksat_hihydro.tif
+# Calibration multiplier applied to the gridded Ksat (HiHydroSoil Ksat is
+# uncertain; one knob to scale infiltration capacity up/down).
+OPM_GA_KSAT_SCALE  = 1.0
 
 # ── Impervious fraction (urban areas shed rain regardless of the VSA) ─────────
 # Per-cell impervious fraction Imp ∈ [0,1].  Effective runoff per cell is

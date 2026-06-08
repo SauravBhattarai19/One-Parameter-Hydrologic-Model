@@ -444,6 +444,69 @@ def download_deficit_raster(dem_path, watershed_geojson_path, output_path,
         return None
 
 
+def download_ksat_raster(dem_path, watershed_geojson_path, output_path,
+                         project=None):
+    """
+    Download the HiHydroSoil v2.0 vertical saturated hydraulic conductivity
+    (Ksat) raster, pixel-aligned to the routing DEM.  Cached to *output_path*.
+
+    Output units: **mm/hr** (human-readable; range ~0–625).
+
+    HiHydroSoil v2.0 stores every layer as int = float × 10000, so the physical
+    value (cm/day) is raw × 0.0001 (verified against the dataset docs — same
+    factor used for `wcsat`).  cm/day → mm/hr is × (10/24).  This Ksat is the
+    *vertical* surface conductivity for Green-Ampt infiltration — NOT the lateral
+    transmissivity OPM_K_SAT that drives the sandbox Darcy drainage.
+
+    Returns the output path on success, or None on failure.
+    """
+    if os.path.isfile(output_path):
+        logger.info("Ksat raster cached: %s", output_path)
+        return output_path
+
+    if not GEE_AVAILABLE:
+        logger.warning("earthengine-api not installed")
+        return None
+
+    if not _authenticate(project):
+        return None
+
+    try:
+        import rasterio
+        import urllib.request
+
+        geometry = _load_watershed_geometry(watershed_geojson_path)
+
+        ksat_col = ee.ImageCollection(
+            "projects/sat-io/open-datasets/HiHydroSoilv2_0/ksat"
+        )
+        # raw × 0.0001 → cm/day ;  × (10/24) → mm/hr
+        ksat_mmhr = ksat_col.mosaic().multiply(0.0001) \
+            .multiply(10.0 / 24.0).rename('ksat_mmhr')
+
+        with rasterio.open(dem_path) as dem:
+            crs = str(dem.crs)
+            t = dem.transform
+            crs_transform = [t.a, t.b, t.c, t.d, t.e, t.f]
+            dimensions = [dem.width, dem.height]
+
+        url = ksat_mmhr.clip(geometry).getDownloadURL({
+            'crs': crs,
+            'crs_transform': crs_transform,
+            'dimensions': dimensions,
+            'format': 'GEO_TIFF',
+        })
+
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        urllib.request.urlretrieve(url, output_path)
+        logger.info("Ksat raster downloaded: %s", output_path)
+        return output_path
+
+    except Exception as exc:
+        logger.warning("GEE Ksat raster download failed: %s", exc)
+        return None
+
+
 # ── Main pipeline ────────────────────────────────────────────────────────────
 
 def compute_opm_params(

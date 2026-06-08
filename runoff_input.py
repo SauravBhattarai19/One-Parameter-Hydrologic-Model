@@ -200,24 +200,25 @@ def _per_zone_sd_from_raster(deficit_path, cell_polygon, n_polygons,
     return np.maximum(sd, sd_min)
 
 
-def _deficit_1d_from_raster(deficit_path, s_rows, s_cols):
+def _raster_band_1d(raster_path, s_rows, s_cols):
     """
-    Per-cell SERVES deficit [(porosity−θ)·Z_r, in m] over the routing grid.
+    Read band 1 of a routing-grid-aligned raster into a per-cell (n_cells,)
+    array (used for the SERVES deficit and the HiHydroSoil Ksat rasters).
 
-    Returns (n_cells,) float64 with nodata/out-of-grid cells set to NaN, or
-    None if the raster grid does not match the routing grid.
+    Returns float64 with nodata/out-of-grid cells set to NaN, or None if the
+    raster grid does not match the routing grid.
     """
-    with rasterio.open(deficit_path) as src:
-        deficit2d = src.read(1).astype(np.float64)
-        nodata    = src.nodata
+    with rasterio.open(raster_path) as src:
+        arr2d  = src.read(1).astype(np.float64)
+        nodata = src.nodata
     if nodata is not None:
-        deficit2d[deficit2d == nodata] = np.nan
+        arr2d[arr2d == nodata] = np.nan
 
     _to_np = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
     sr = _to_np(s_rows); sc = _to_np(s_cols)
-    if sr.max() >= deficit2d.shape[0] or sc.max() >= deficit2d.shape[1]:
+    if sr.max() >= arr2d.shape[0] or sc.max() >= arr2d.shape[1]:
         return None
-    return deficit2d[sr, sc]
+    return arr2d[sr, sc]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -560,10 +561,15 @@ class RunoffEngine:
         if self._infiltration == 'green_ampt':
             self._ga_psi = float(getattr(cfg, 'OPM_GA_SUCTION_M', 0.15))
             # Vertical surface infiltration capacity (NOT the lateral OPM_K_SAT).
-            kv_ms = float(getattr(cfg, 'OPM_GA_KSAT_MMHR', 12.0)) / 1000.0 / 3600.0
+            kv_scalar = float(getattr(cfg, 'OPM_GA_KSAT_MMHR', 12.0))   # mm/hr
 
             s_rows = grid_data['s_rows']
             s_cols = grid_data['s_cols']
+
+            # Per-cell vertical Ksat [mm/hr].  Uniform scalar, or gridded
+            # HiHydroSoil v2.0 Ksat (source='gee'/'raster'); nodata→scalar.
+            kv_mmhr = self._resolve_ga_ksat_mmhr(cfg, grid_data, kv_scalar)
+            kv_ms_1d = kv_mmhr / 1000.0 / 3600.0                       # → m/s
 
             # Root-zone depth Z_r per cell from the SAME land-cover source that
             # built the SERVES deficit raster, so Δθ₀ = deficit / Z_r is consistent.
@@ -581,7 +587,7 @@ class RunoffEngine:
             dtheta0_np = None
             deficit_raster = params.get('deficit_raster')
             if deficit_raster:
-                dfc = _deficit_1d_from_raster(deficit_raster, s_rows, s_cols)
+                dfc = _raster_band_1d(deficit_raster, s_rows, s_cols)
                 if dfc is not None:
                     with np.errstate(invalid='ignore', divide='ignore'):
                         dtheta0_np = dfc / zr_np
@@ -592,11 +598,11 @@ class RunoffEngine:
                 dtheta0_np[_bad] = _fallback
             dtheta0_np = np.clip(dtheta0_np, 0.0, 1.0)
 
-            self._ga_ksat    = xp.asarray(
-                np.full(self._n_cells, kv_ms, dtype=np.float64))
+            self._ga_ksat    = xp.asarray(kv_ms_1d)
             self._ga_dtheta0 = xp.asarray(dtheta0_np)
             self._ga_F       = xp.zeros(self._n_cells, dtype=np.float64)
-            print(f"  Green-Ampt    |  K_v={kv_ms*1000*3600:.1f} mm/hr"
+            print(f"  Green-Ampt    |  K_v(mm/hr)=[{kv_mmhr.min():.2f}, "
+                  f"{kv_mmhr.max():.2f}] mean={kv_mmhr.mean():.2f}"
                   f"  psi={self._ga_psi} m"
                   f"  dtheta0=[{dtheta0_np.min():.3f}, {dtheta0_np.max():.3f}]"
                   f"  mean={dtheta0_np.mean():.3f}")
@@ -755,6 +761,66 @@ class RunoffEngine:
                   f" ({100*self._vsa_mask.mean():.1f}% of watershed)")
 
     # ── OPM sandbox update ────────────────────────────────────────────────────
+
+    def _resolve_ga_ksat_mmhr(self, cfg, grid_data, kv_scalar):
+        """
+        Per-cell Green-Ampt vertical Ksat [mm/hr].
+
+          'scalar' → uniform kv_scalar.
+          'gee'    → HiHydroSoil v2.0 Ksat downloaded aligned to the routing DEM
+                     (cached); nodata/≤0 cells fall back to kv_scalar.
+          'raster' → pre-computed mm/hr GeoTIFF at OPM_GA_KSAT_RASTER.
+        OPM_GA_KSAT_SCALE multiplies the gridded values (calibration knob).
+        """
+        n      = self._n_cells
+        source = getattr(cfg, 'OPM_GA_KSAT_SOURCE', 'scalar').lower()
+        scale  = float(getattr(cfg, 'OPM_GA_KSAT_SCALE', 1.0))
+        if source == 'scalar':
+            return np.full(n, kv_scalar, dtype=np.float64)
+
+        path = getattr(cfg, 'OPM_GA_KSAT_RASTER', None) \
+            or (getattr(cfg, 'OUTPUT_DIR', 'output/') + 'ksat_hihydro.tif')
+
+        if source == 'gee':
+            try:
+                from serves_gee import download_ksat_raster
+                got = download_ksat_raster(
+                    dem_path=cfg.ROUTING_DEM_PATH,
+                    watershed_geojson_path=getattr(
+                        cfg, 'OPM_WATERSHED_GEOJSON', 'output/watershed.geojson'),
+                    output_path=path,
+                    project=getattr(cfg, 'GEE_PROJECT', None))
+            except Exception as exc:
+                print(f"  [WARN] Ksat download failed ({exc}); "
+                      f"scalar K_v={kv_scalar} mm/hr")
+                got = None
+            if not got:
+                return np.full(n, kv_scalar, dtype=np.float64)
+        elif source == 'raster':
+            if not (path and os.path.isfile(path)):
+                print(f"  [WARN] OPM_GA_KSAT_RASTER not found: {path}; "
+                      f"scalar K_v={kv_scalar} mm/hr")
+                return np.full(n, kv_scalar, dtype=np.float64)
+        else:
+            raise ValueError(f"Unknown OPM_GA_KSAT_SOURCE: '{source}'")
+
+        kv = _raster_band_1d(path, grid_data['s_rows'], grid_data['s_cols'])
+        if kv is None:
+            print("  [WARN] Ksat raster grid ≠ routing grid; "
+                  f"scalar K_v={kv_scalar} mm/hr")
+            return np.full(n, kv_scalar, dtype=np.float64)
+        kv = kv * scale
+        bad = ~np.isfinite(kv) | (kv <= 0.0)
+        if bad.any():
+            # Fill HiHydroSoil gaps with the valid-cell median (consistent with
+            # the surrounding soil) rather than the fixed scalar, which can be
+            # an order of magnitude off and create a spurious discontinuity.
+            good = ~bad
+            fill = float(np.median(kv[good])) if good.any() else kv_scalar
+            kv[bad] = fill
+            print(f"  Ksat gaps     |  {int(bad.sum()):,}/{n:,} nodata cells "
+                  f"filled with median {fill:.2f} mm/hr")
+        return kv
 
     def _update_opm_sandbox(self, rain_1d, dt):
         """Advance OPM sandbox state by one timestep (dispatches to mode)."""
