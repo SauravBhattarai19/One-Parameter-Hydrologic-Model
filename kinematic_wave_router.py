@@ -98,6 +98,14 @@ def initialise_grid(cfg):
     faccum_1d = faccum[s_rows, s_cols]         # flow accumulation [cell count] for VSA/OPM
     cell_area = cell_size ** 2                  # [m²]  (same for every cell)
 
+    # Static arrays for the diffusive-wave scheme (water-surface slope needs bed
+    # elevation and the true flow-path length; harmless to build even when kinematic).
+    dem_1d  = dem[s_rows, s_cols].astype(np.float64)        # bed elevation [m]
+    fdir_1d = fdir[s_rows, s_cols]
+    dist_1d = cell_size * np.where(                          # flow-path length to downstream [m]
+        np.isin(fdir_1d, list(ru.D8_DIAGONAL)), np.sqrt(2.0), 1.0
+    ).astype(np.float64)
+
     # --- Index of outlet in the sorted list ---
     outlet_pos = n_cells - 1  # last element (highest accumulation = downstream-most)
 
@@ -110,6 +118,8 @@ def initialise_grid(cfg):
         "s_rows"     : s_rows,        # 1-D topologically sorted row indices
         "s_cols"     : s_cols,        # 1-D topologically sorted col indices
         "slope_1d"   : slope_1d,      # [m/m]
+        "dem_1d"     : dem_1d,        # [m] bed elevation in topo order (diffusive wave)
+        "dist_1d"    : dist_1d,       # [m] flow-path length to downstream (diffusive wave)
         "faccum_1d"  : faccum_1d,     # [cell count] flow accumulation in topo order
         "ds_idx"     : ds_idx,        # downstream position index (-1 = outlet/off-mask)
         "n_cells"    : n_cells,
@@ -122,6 +132,11 @@ def initialise_grid(cfg):
         "transform"  : transform,
     }
 
+    # ── Resolve spatially variable Manning's n ──────────────────────────────
+    print("  Resolving Manning's n...")
+    n_1d = ru.resolve_mannings_n(cfg, grid_data)
+    grid_data["n_1d"] = n_1d
+
     # ── Transfer hot arrays to GPU (must happen BEFORE engine construction) ───
     # Engines read grid_data['faccum_1d'] and grid_data['slope_1d'] during
     # __init__; they must already be CuPy arrays so engine state is on GPU.
@@ -130,15 +145,24 @@ def initialise_grid(cfg):
         slope_1d  = gpu_utils.to_device(slope_1d.astype(_dtype),  xp)
         ds_idx    = gpu_utils.to_device(ds_idx,                    xp)
         faccum_1d = gpu_utils.to_device(faccum_1d.astype(_dtype),  xp)
+        n_1d      = gpu_utils.to_device(n_1d.astype(_dtype),       xp)
+        dem_1d    = gpu_utils.to_device(dem_1d.astype(_dtype),     xp)
+        dist_1d   = gpu_utils.to_device(dist_1d.astype(_dtype),    xp)
         grid_data["slope_1d"]  = slope_1d
         grid_data["ds_idx"]    = ds_idx
         grid_data["faccum_1d"] = faccum_1d
+        grid_data["n_1d"]      = n_1d
+        grid_data["dem_1d"]    = dem_1d
+        grid_data["dist_1d"]   = dist_1d
 
     grid_data["xp"] = xp   # carried into run_time_loop
 
     # Build precipitation engine (uses grid_data for spatial weight construction)
     print("  Building precipitation engine...")
     grid_data["precip_engine"] = _PrecipEngine(cfg, grid_data)
+
+    # Expose per-cell zone assignment for per-polygon VSA sandbox
+    grid_data["cell_polygon"] = grid_data["precip_engine"].cell_polygon
 
     # Build runoff generation engine (optional; None when RUNOFF_SOURCE='none')
     _rsrc = getattr(cfg, 'RUNOFF_SOURCE', 'none').lower()
@@ -172,7 +196,7 @@ def run_time_loop(grid_data, cfg):
     """
     dt        = cfg.TIME_STEP_SECONDS
     n_steps   = int(cfg.TOTAL_SIMULATION_TIME_HOURS * 3600.0 / dt)
-    n         = cfg.MANNINGS_N
+    n         = grid_data.get("n_1d", cfg.MANNINGS_N)
 
     # Output write frequency: every N steps (rounded up to at least 1)
     _out_interval = getattr(cfg, 'OUTPUT_INTERVAL_SECONDS', None)
@@ -183,12 +207,22 @@ def run_time_loop(grid_data, cfg):
     s_rows         = grid_data["s_rows"]
     s_cols         = grid_data["s_cols"]
     slope_1d       = grid_data["slope_1d"]
+    dem_1d         = grid_data["dem_1d"]
+    dist_1d        = grid_data["dist_1d"]
     ds_idx         = grid_data["ds_idx"]
     n_cells        = grid_data["n_cells"]
     outlet_pos     = grid_data["outlet_pos"]
     ws_mask        = grid_data["ws_mask"]
     precip_engine  = grid_data["precip_engine"]
     runoff_engine  = grid_data.get("runoff_engine")   # None when RUNOFF_SOURCE='none'
+
+    # ── Routing scheme ────────────────────────────────────────────────────────
+    scheme = getattr(cfg, 'ROUTING_SCHEME', 'kinematic').lower()
+    theta  = float(getattr(cfg, 'DIFFUSION_THETA', 1.0))
+    if scheme == 'diffusive':
+        print(f"  Routing scheme: DIFFUSIVE wave (water-surface slope, θ={theta:g})")
+    else:
+        print("  Routing scheme: KINEMATIC wave (bed slope)")
 
     # ── Array module (numpy or cupy) ─────────────────────────────────────────
     xp     = grid_data.get("xp", np)
@@ -201,6 +235,15 @@ def run_time_loop(grid_data, cfg):
 
     hydrograph = []  # list of (time_seconds, Q_m3s) — Python floats
 
+    # Baseflow offset: add the steady pre-storm discharge (OPM_Q_MAX) so the
+    # reported outlet hydrograph starts at baseflow instead of zero, making it
+    # directly comparable to observed (gauged) discharge.  Pure additive offset
+    # on the routed stormflow — does not affect routing/runoff generation.
+    q_base = (float(getattr(cfg, 'OPM_Q_MAX', 0.0))
+              if getattr(cfg, 'OPM_BASEFLOW', False) else 0.0)
+    if q_base:
+        print(f"  Baseflow offset added to outlet: {q_base:.3f} m³/s")
+
     print("=" * 60)
     print(f"TIME LOOP  |  steps={n_steps:,}  dt={dt}s  "
           f"sim={cfg.TOTAL_SIMULATION_TIME_HOURS}h")
@@ -212,7 +255,8 @@ def run_time_loop(grid_data, cfg):
     # limiter is critical. Print an advisory so the user can reduce dt if needed.
     # Use .item() so the comparison works for both CuPy and NumPy scalars.
     max_slope         = float(slope_1d.max().item())
-    V_at_1m_max_slope = (1.0 / n) * (1.0 ** (2.0 / 3.0)) * (max_slope ** 0.5)
+    n_min             = float(n.min().item()) if hasattr(n, 'min') else float(n)
+    V_at_1m_max_slope = (1.0 / n_min) * (1.0 ** (2.0 / 3.0)) * (max_slope ** 0.5)
     C_indicator       = V_at_1m_max_slope * dt / dx
     safe_dt           = dx / V_at_1m_max_slope
     if C_indicator > 1.0:
@@ -224,8 +268,27 @@ def run_time_loop(grid_data, cfg):
     print()
 
     # ── Pre-compute static scatter-add masks (ds_idx never changes) ──────────
-    valid_ds     = ds_idx >= 0          # mask: cell has a valid downstream neighbour
-    ds_positions = ds_idx[valid_ds]     # downstream position indices
+    valid_ds      = ds_idx >= 0         # mask: cell has a valid downstream neighbour
+    ds_positions  = ds_idx[valid_ds]    # downstream position indices
+    ds_safe       = xp.where(valid_ds, ds_idx, 0)   # gather-safe index (diffusive scheme)
+    boundary_mask = ~valid_ds           # cells whose Q_out leaves the domain (outlet + off-mask)
+    boundary_f    = boundary_mask.astype(_dtype)    # float mask for hot-loop reduction
+
+    # ── Mass-balance accumulators (always on; routing is exactly conservative,
+    #    so |error/input| should be ~machine precision — any departure flags a bug) ──
+    mb_in   = xp.zeros((), dtype=_dtype)   # Σ effective-runoff volume entering routing [m³]
+    mb_out  = xp.zeros((), dtype=_dtype)   # Σ volume leaving the domain at boundary cells [m³]
+    mb_rain = xp.zeros((), dtype=_dtype)   # Σ gross rainfall volume [m³] (for runoff ratio)
+
+    # ── Runoff-mechanism partition (vsa_opm only) ────────────────────────────
+    # Σ effective-runoff volume by generating mechanism [m³].  The three sum
+    # EXACTLY to mb_in (effective runoff IN) by construction in the engine.
+    _partition = (runoff_engine is not None
+                  and getattr(runoff_engine, '_mode', None) == 'vsa_opm')
+    mb_dunne  = xp.zeros((), dtype=_dtype)   # Σ Dunne / saturation-excess [m³]
+    mb_horton = xp.zeros((), dtype=_dtype)   # Σ Horton / infiltration-excess [m³]
+    mb_imperv = xp.zeros((), dtype=_dtype)   # Σ impervious (urban) shedding [m³]
+    partition_series = []   # (time_hr, cum_dunne_m3, cum_horton_m3, cum_imperv_m3)
 
     Q_outlet     = 0.0                  # initialise for progress reporting
     t_wall_start = time.time()
@@ -260,8 +323,16 @@ def run_time_loop(grid_data, cfg):
         # The flux limiter already prevents numerical runaway; deeper cells
         # simply get larger Q_out and drain faster (physically correct).
 
-        velocity_1d = ru.mannings_velocity(depth_1d, slope_1d, n)      # [m/s]
-        Q_out_1d    = ru.cell_discharge(depth_1d, velocity_1d, dx)     # [m³/s]
+        if scheme == 'diffusive':
+            # Diffusion wave: Manning on the water-surface slope along the flow path,
+            # with conveyance on the flow-depth-over-the-higher-bed (CASC2D/GSSHA-style).
+            Q_out_1d = ru.diffusive_wave_discharge(
+                depth_1d, dem_1d, dist_1d, slope_1d, n, ds_safe, valid_ds,
+                theta, dx, xp, cfg.MIN_DEPTH_M,
+            )                                                          # [m³/s]
+        else:
+            velocity_1d = ru.mannings_velocity(depth_1d, slope_1d, n)  # [m/s]
+            Q_out_1d    = ru.cell_discharge(depth_1d, velocity_1d, dx) # [m³/s]
         # Apply volume-conservative CFL limiter: a cell cannot eject more
         # water than it stores in one time step (prevents Courant runaway).
         # Inlined with xp.minimum/xp.maximum so it works on both CPU and GPU.
@@ -273,6 +344,11 @@ def run_time_loop(grid_data, cfg):
         # With RUNOFF_SOURCE='none', source_1d == rain_1d (bit-identical to old code).
         if runoff_engine is not None:
             source_1d = runoff_engine.get_effective_1d(t_seconds, rain_1d)  # [m/s]
+            if _partition:
+                # Component rates [m/s] stashed by _opm_effective_runoff this step.
+                mb_dunne  += runoff_engine._last_dunne_rate.sum()  * (cell_area * dt)
+                mb_horton += runoff_engine._last_horton_rate.sum() * (cell_area * dt)
+                mb_imperv += runoff_engine._last_imperv_rate.sum() * (cell_area * dt)
             runoff_engine.update_state(rain_1d, dt)
         else:
             source_1d = rain_1d
@@ -284,6 +360,11 @@ def run_time_loop(grid_data, cfg):
                       - Q_out_1d  * dt)
         volume_1d  = xp.maximum(volume_1d, 0.0)     # no negative storage
 
+        # ── Mass-balance accumulation (device reductions; transferred once at end) ──
+        mb_in   += rain_vol.sum()                       # effective runoff entering routing
+        mb_out  += (Q_out_1d * boundary_f).sum() * dt   # routed volume leaving the domain
+        mb_rain += rain_1d.sum() * (cell_area * dt)      # gross rainfall (for runoff ratio)
+
         # ── 4. Record outlet hydrograph (at output interval, not every step) ───
         # Evaluate Q_outlet only when needed to minimise GPU→CPU transfers.
         _need_q = (
@@ -293,10 +374,19 @@ def run_time_loop(grid_data, cfg):
         )
         if _need_q:
             # .item() converts CuPy 0-d → Python float (8-byte D→H); no-op on NumPy.
-            Q_outlet = float(Q_out_1d[outlet_pos].item())
+            Q_outlet = float(Q_out_1d[outlet_pos].item()) + q_base
 
         if (step + 1) % write_every == 0 or step == n_steps - 1:
             hydrograph.append((t_seconds + dt, Q_outlet))
+            if _partition:
+                # Cumulative mechanism volumes [m³] at the hydrograph cadence —
+                # one D→H transfer per recorded row (cheap, same rate as Q).
+                partition_series.append((
+                    (t_seconds + dt) / 3600.0,
+                    float(mb_dunne.item()),
+                    float(mb_horton.item()),
+                    float(mb_imperv.item()),
+                ))
 
         # Progress reporting every 10 % of simulation
         if (step + 1) % max(1, n_steps // 10) == 0:
@@ -307,7 +397,128 @@ def run_time_loop(grid_data, cfg):
                   f"|  wall={elapsed:.1f}s")
 
     print(f"\n  Simulation finished in {time.time()-t_wall_start:.1f}s")
+
+    # ── Mass balance ─────────────────────────────────────────────────────────
+    # Budget on the routed water:  INPUT − OUTFLOW − STORAGE = ERROR.
+    # STORAGE includes water still in cells PLUS the final step's interior outflow,
+    # which is "in transit" (subtracted from upstream cells but, due to the one-step
+    # routing lag, not yet scattered downstream).  Accounting for it makes the budget
+    # close to machine precision when the scheme is conservative — so any non-trivial
+    # error is a genuine red flag rather than a loop-boundary artefact.
+    inflight   = float((Q_out_1d[valid_ds].sum()).item()) * dt
+    storage    = float(volume_1d.sum().item()) + inflight
+    input_m3   = float(mb_in.item())
+    outflow_m3 = float(mb_out.item())
+    rain_m3    = float(mb_rain.item())
+    error_m3   = input_m3 - outflow_m3 - storage
+    rel_error  = error_m3 / input_m3 if input_m3 > 0 else 0.0
+    runoff_ratio = input_m3 / rain_m3 if rain_m3 > 0 else 0.0
+    status     = "PASS" if abs(rel_error) < 1e-6 else "WARN"
+
+    print("\n" + "=" * 60)
+    print("MASS BALANCE  (routed water budget)")
+    print("=" * 60)
+    print(f"  Gross rainfall     : {rain_m3:16.3f} m³")
+    print(f"  Effective runoff IN: {input_m3:16.3f} m³   (runoff ratio {runoff_ratio:.3f})")
+    print(f"  Outflow at boundary: {outflow_m3:16.3f} m³")
+    print(f"  Storage (end+transit): {storage:14.3f} m³")
+    print(f"  Closure error      : {error_m3:16.3f} m³   ({100.0*rel_error:+.2e} % of input)  [{status}]")
+    if status == "WARN":
+        print("  [WARNING] Mass balance error exceeds 1e-6 — investigate routing/runoff.")
+
+    # ── Runoff-mechanism partition (vsa_opm only) ────────────────────────────
+    partition = None
+    if _partition:
+        dunne_m3  = float(mb_dunne.item())
+        horton_m3 = float(mb_horton.item())
+        imperv_m3 = float(mb_imperv.item())
+        comp_sum  = dunne_m3 + horton_m3 + imperv_m3
+        f_dunne   = dunne_m3  / input_m3 if input_m3 > 0 else 0.0
+        f_horton  = horton_m3 / input_m3 if input_m3 > 0 else 0.0
+        f_imperv  = imperv_m3 / input_m3 if input_m3 > 0 else 0.0
+        # Closure check: the three components must sum to the effective runoff IN.
+        part_err  = (comp_sum - input_m3) / input_m3 if input_m3 > 0 else 0.0
+        partition = dict(dunne_m3=dunne_m3, horton_m3=horton_m3, imperv_m3=imperv_m3,
+                         dunne_frac=f_dunne, horton_frac=f_horton, imperv_frac=f_imperv)
+        print("-" * 60)
+        print("RUNOFF PARTITION  (by generating mechanism)")
+        print(f"  Dunne  (saturation-excess): {dunne_m3:16.3f} m³   ({100*f_dunne:5.1f} %)")
+        print(f"  Horton (infiltration-exc.): {horton_m3:16.3f} m³   ({100*f_horton:5.1f} %)")
+        print(f"  Impervious (urban shed)   : {imperv_m3:16.3f} m³   ({100*f_imperv:5.1f} %)")
+        print(f"  Σ components vs runoff IN  : {part_err:+.2e}  rel  "
+              f"[{'PASS' if abs(part_err) < 1e-6 else 'WARN'}]")
+        _write_partition_series(cfg, partition_series)
+
+    if getattr(cfg, 'MASS_BALANCE_REPORT', True):
+        _append_mass_balance_csv(cfg, scheme, theta, rain_m3, input_m3,
+                                 outflow_m3, storage, error_m3, rel_error,
+                                 runoff_ratio, partition)
+
     return hydrograph
+
+
+def _write_partition_series(cfg, series):
+    """Write the cumulative Dunne/Horton/Impervious time series to
+    {OUTPUT_DIR}/partition_{RUN_TAG}.csv (one file per event)."""
+    if not series:
+        return
+    import csv
+    tag = getattr(cfg, 'RUN_TAG', None)
+    out_dir = getattr(cfg, 'OUTPUT_DIR', 'output/')
+    fname = f"partition_{tag}.csv" if tag else "partition.csv"
+    path = os.path.join(out_dir, fname)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['time_hr', 'dunne_m3', 'horton_m3', 'imperv_m3'])
+        for t_hr, d, h, i in series:
+            w.writerow([f"{t_hr:.4f}", f"{d:.3f}", f"{h:.3f}", f"{i:.3f}"])
+    print(f"  Partition time series  → {path}")
+
+
+def _append_mass_balance_csv(cfg, scheme, theta, rain_m3, input_m3, outflow_m3,
+                             storage_m3, error_m3, rel_error, runoff_ratio,
+                             partition=None):
+    """Append one row of the mass-balance budget to MASS_BALANCE_CSV (header on create).
+    Appends so successive runs at different configs accumulate for side-by-side review.
+    The row also carries the run tag, the key runoff knobs, and (when available) the
+    Dunne/Horton/Impervious mechanism partition so a sweep is self-describing."""
+    import csv
+    from datetime import datetime
+
+    path = getattr(cfg, 'MASS_BALANCE_CSV', None) or (
+        getattr(cfg, 'OUTPUT_DIR', 'output/') + 'mass_balance.csv')
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    p = partition or {}
+    header = ['timestamp', 'run_tag', 'scheme', 'theta', 'runoff_source',
+              'sd_source', 'sd_max', 'ksat_scale', 'infiltration', 'impervious',
+              'rain_m3', 'input_m3', 'outflow_m3', 'storage_m3',
+              'error_m3', 'rel_error', 'runoff_ratio',
+              'dunne_m3', 'horton_m3', 'imperv_m3',
+              'dunne_frac', 'horton_frac', 'imperv_frac']
+    def _f(key, fmt="{}"):
+        v = p.get(key)
+        return "" if v is None else fmt.format(v)
+    row = [datetime.now().isoformat(timespec='seconds'),
+           getattr(cfg, 'RUN_TAG', ''),
+           scheme, theta, getattr(cfg, 'RUNOFF_SOURCE', 'none'),
+           getattr(cfg, 'OPM_SD_SOURCE', ''),
+           getattr(cfg, 'OPM_SD_MAX_INITIAL', ''),
+           getattr(cfg, 'OPM_GA_KSAT_SCALE', ''),
+           getattr(cfg, 'OPM_INFILTRATION', ''),
+           getattr(cfg, 'IMPERVIOUS_SOURCE', ''),
+           f"{rain_m3:.3f}", f"{input_m3:.3f}", f"{outflow_m3:.3f}",
+           f"{storage_m3:.3f}", f"{error_m3:.6e}", f"{rel_error:.6e}",
+           f"{runoff_ratio:.4f}",
+           _f('dunne_m3', "{:.3f}"), _f('horton_m3', "{:.3f}"), _f('imperv_m3', "{:.3f}"),
+           _f('dunne_frac', "{:.4f}"), _f('horton_frac', "{:.4f}"), _f('imperv_frac', "{:.4f}")]
+    write_header = not os.path.exists(path)
+    with open(path, 'a', newline='') as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        w.writerow(row)
+    print(f"  Mass-balance row appended → {path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

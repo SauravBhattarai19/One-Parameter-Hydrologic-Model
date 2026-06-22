@@ -44,12 +44,12 @@ class PrecipEngineGPU(PrecipEngine):
         IDW      → full weight matrix transferred to GPU.
         Uniform  → scalar broadcast; no matrix needed.
         """
-        if self._method == 'uniform':
+        if self._weight_method == 'uniform':
             # Scalar broadcast; _weights is a (n_cells, 1) ones matrix from
             # the parent — not used in get_field_1d; nothing to transfer.
             pass
 
-        elif self._method == 'thiessen':
+        elif self._weight_method == 'thiessen':
             # Each row has exactly one 1 — replace with its column index.
             W_cpu = self._weights                          # (n_cells, n_gauges)
             nearest = np.argmax(W_cpu, axis=1).astype(np.int32)
@@ -70,12 +70,12 @@ class PrecipEngineGPU(PrecipEngine):
         """
         gauge_rates_np = self._interp_gauges(t_seconds)   # (n_gauges,) numpy
 
-        if self._method == 'uniform':
+        if self._weight_method == 'uniform':
             # Scalar broadcast — fastest possible path.
             rate = float(gauge_rates_np[0])
             return cp.full(self._n_cells, rate, dtype=np.float64)
 
-        elif self._method == 'thiessen':
+        elif self._weight_method == 'thiessen':
             # Fancy index: gauge_rates_gpu[nearest_idx_gpu]
             # H2D transfer of gauge_rates is ~13 µs; negligible vs step time.
             gr = cp.asarray(gauge_rates_np)

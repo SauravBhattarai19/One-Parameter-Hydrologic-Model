@@ -36,13 +36,16 @@ def _build_thiessen_weights(cell_coords, gauge_coords):
     """
     Nearest-neighbour (Voronoi / Thiessen) weights.
 
-    Returns (n_cells, n_gauges) 0/1 matrix — each row has exactly one 1.
+    Returns
+    -------
+    W       : (n_cells, n_gauges) 0/1 matrix — each row has exactly one 1.
+    nearest : (n_cells,) int array — index of nearest gauge per cell.
     """
     from scipy.spatial import KDTree
     _, nearest = KDTree(gauge_coords).query(cell_coords, k=1)
     W = np.zeros((len(cell_coords), len(gauge_coords)), dtype=np.float64)
     W[np.arange(len(cell_coords)), nearest] = 1.0
-    return W
+    return W, nearest
 
 
 def _build_idw_weights(cell_coords, gauge_coords, power=2.0):
@@ -93,13 +96,39 @@ class PrecipEngine:
         self._n_cells = grid_data['n_cells']
 
         if self._method == 'uniform':
+            self._weight_method = 'uniform'
             self._init_uniform(cfg)
         elif self._method in ('thiessen', 'idw'):
-            self._init_gauge(cfg, grid_data)
+            # Source and weighting are the same for plain gauge methods.
+            self._weight_method = self._method
+            self._init_gauge(cfg, grid_data,
+                             cfg.PRECIP_GAUGE_FILE, cfg.PRECIP_TIMESERIES_FILE)
+        elif self._method in ('imerg_thiessen', 'imerg_idw'):
+            # IMERG source: download (if needed) gridded pseudo-gauges, then apply
+            # the weighting named in the suffix.  Reuses the gauge machinery.
+            self._weight_method = self._method.split('_', 1)[1]   # 'thiessen'|'idw'
+            # Derive IMERG window from EVENT_START_UTC + TOTAL_SIMULATION_TIME_HOURS.
+            _evt   = getattr(cfg, 'EVENT_START_UTC', None)
+            _sim_h = float(getattr(cfg, 'TOTAL_SIMULATION_TIME_HOURS', 0) or 0)
+            _off   = float(getattr(cfg, 'IMERG_UTC_OFFSET_HOURS', 0.0))
+            if _evt:
+                from datetime import datetime, timedelta as _td
+                _utc_start = datetime.fromisoformat(str(_evt).strip())
+                _utc_end   = _utc_start + _td(hours=_sim_h)
+                if not getattr(cfg, 'IMERG_START_LOCAL', None):
+                    cfg.IMERG_START_LOCAL = (_utc_start + _td(hours=_off)).strftime("%Y-%m-%d %H:%M")
+                    print(f"  IMERG_START_LOCAL  → {cfg.IMERG_START_LOCAL}  (EVENT_START_UTC + offset)")
+                if not getattr(cfg, 'IMERG_END_LOCAL', None):
+                    cfg.IMERG_END_LOCAL = (_utc_end + _td(hours=_off)).strftime("%Y-%m-%d %H:%M")
+                    print(f"  IMERG_END_LOCAL    → {cfg.IMERG_END_LOCAL}  (start + {_sim_h:.0f}h)")
+            from imerg_gee import ensure_imerg_data
+            gauge_file, ts_file = ensure_imerg_data(cfg)
+            self._init_gauge(cfg, grid_data, gauge_file, ts_file)
         else:
             raise ValueError(
                 f"PRECIP_METHOD='{self._method}' is not recognised. "
-                "Choose 'uniform', 'thiessen', or 'idw'."
+                "Choose 'uniform', 'thiessen', 'idw', 'imerg_thiessen', "
+                "or 'imerg_idw'."
             )
 
         print(f"  PrecipEngine    |  method={self._method}"
@@ -124,14 +153,52 @@ class PrecipEngine:
                                    [0.0]])        # shape (3, 1)
         self._weights  = np.ones((self._n_cells, 1), dtype=np.float64)
         self._n_gauges = 1
+        self._cell_polygon = None   # no zones for uniform rainfall
 
-    def _init_gauge(self, cfg, grid_data):
+    def _drop_outside_stations(self, gauges_df, gauge_ids, grid_data):
+        """
+        Return the subset of *gauge_ids* whose centroid lands on an active
+        watershed cell.  Inside-ness is tested against the watershed cell set
+        (s_rows/s_cols) rather than a polygon, so it works for any caller.
+        Falls back to the full list (with a warning) if none are inside.
+        """
+        t = grid_data['transform']
+        mask = np.zeros((self._nrows, self._ncols), dtype=bool)
+        mask[self._s_rows, self._s_cols] = True
+
+        keep = []
+        for gid in gauge_ids:
+            e = float(gauges_df.loc[gid, 'easting_m'])
+            n = float(gauges_df.loc[gid, 'northing_m'])
+            col = int((e - t.c) / t.a)
+            row = int((n - t.f) / t.e)
+            if 0 <= row < self._nrows and 0 <= col < self._ncols \
+                    and mask[row, col]:
+                keep.append(gid)
+
+        n_drop = len(gauge_ids) - len(keep)
+        if not keep:
+            print(f"  [WARN] PRECIP_EXCLUDE_OUTSIDE_STATIONS: all "
+                  f"{len(gauge_ids)} stations are outside the watershed; "
+                  f"keeping all.")
+            return gauge_ids
+        if n_drop:
+            print(f"  Stations        |  excluded {n_drop} outside watershed "
+                  f"({len(keep)}/{len(gauge_ids)} kept)")
+        return keep
+
+    def _init_gauge(self, cfg, grid_data, gauge_file, timeseries_file):
         """
         Load gauges.csv + timeseries.csv, convert mm depth → m/s rates,
         and build the spatial weight matrix (Thiessen or IDW).
+
+        The weighting scheme is taken from ``self._weight_method`` ('thiessen' or
+        'idw'), which is independent of ``self._method`` (so an 'imerg_*' source can
+        reuse this path).  ``gauge_file``/``timeseries_file`` are passed explicitly
+        because IMERG reads from a downloaded folder rather than PRECIP_GAUGE_FILE.
         """
-        gauges_df = pd.read_csv(cfg.PRECIP_GAUGE_FILE).set_index('gauge_id')
-        ts_df     = pd.read_csv(cfg.PRECIP_TIMESERIES_FILE)
+        gauges_df = pd.read_csv(gauge_file).set_index('gauge_id')
+        ts_df     = pd.read_csv(timeseries_file)
 
         gauge_ids = gauges_df.index.tolist()
 
@@ -140,11 +207,35 @@ class PrecipEngine:
         if missing:
             raise ValueError(
                 f"Gauges {sorted(missing)} are listed in "
-                f"{cfg.PRECIP_GAUGE_FILE} but have no matching column in "
-                f"{cfg.PRECIP_TIMESERIES_FILE}."
+                f"{gauge_file} but have no matching column in "
+                f"{timeseries_file}."
             )
 
+        # Optionally drop stations whose centroid falls outside the watershed.
+        # Done here (once) so the same station set drives both the rainfall
+        # weights and the per-zone SD partition (cell_polygon).
+        if getattr(cfg, 'PRECIP_EXCLUDE_OUTSIDE_STATIONS', False):
+            gauge_ids = self._drop_outside_stations(gauges_df, gauge_ids, grid_data)
+            gauges_df = gauges_df.loc[gauge_ids]
+
         time_s_raw = ts_df['time_s'].values.astype(np.float64)
+
+        # Warn if timeseries is shorter than the simulation — the router already
+        # returns zero rainfall after the last gauge record, but the user should
+        # know so they can check whether truncation is intentional.
+        _sim_h = getattr(cfg, 'TOTAL_SIMULATION_TIME_HOURS', None)
+        if _sim_h is not None:
+            _sim_end_s = float(_sim_h) * 3600.0
+            if time_s_raw[-1] < _sim_end_s - 1.0:
+                _gap_h = (_sim_end_s - time_s_raw[-1]) / 3600.0
+                print(f"  [WARN] Gauge timeseries ends at "
+                      f"t={time_s_raw[-1]/3600:.2f}h but simulation runs "
+                      f"{_sim_h:.1f}h — zero rainfall assumed for the "
+                      f"remaining {_gap_h:.2f}h.")
+            if time_s_raw[0] > 1.0:
+                _pre_h = time_s_raw[0] / 3600.0
+                print(f"  [WARN] Gauge timeseries starts at t={_pre_h:.2f}h "
+                      f"(not t=0) — zero rainfall assumed before first record.")
 
         # mm depth per interval → m/s rate
         # interval_s[i] = duration of the interval ending at row i
@@ -176,10 +267,13 @@ class PrecipEngine:
         gauge_xy = gauges_df[['easting_m', 'northing_m']].values.astype(np.float64)
 
         power = getattr(cfg, 'PRECIP_IDW_POWER', 2.0)
-        if self._method == 'thiessen':
-            self._weights = _build_thiessen_weights(cell_xy, gauge_xy)
+        if self._weight_method == 'thiessen':
+            self._weights, self._cell_polygon = _build_thiessen_weights(cell_xy, gauge_xy)
         else:
             self._weights = _build_idw_weights(cell_xy, gauge_xy, power)
+            # For IDW: zone cells by nearest gauge for per-polygon VSA sandbox
+            from scipy.spatial import KDTree
+            _, self._cell_polygon = KDTree(gauge_xy).query(cell_xy, k=1)
 
         # Sanity check: rows should sum to ~1
         row_sums = self._weights.sum(axis=1)
@@ -237,6 +331,11 @@ class PrecipEngine:
     def is_raining(self, t_seconds):
         """True if any active cell receives non-zero rain at *t_seconds*."""
         return bool(self.get_field_1d(t_seconds).max() > 0.0)
+
+    @property
+    def cell_polygon(self):
+        """Per-cell nearest-gauge zone index (n_cells,) int, or None for uniform."""
+        return self._cell_polygon
 
     @property
     def rain_end_seconds(self):

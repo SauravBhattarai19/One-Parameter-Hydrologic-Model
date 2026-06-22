@@ -75,8 +75,14 @@ class RunoffEngineGPU(RunoffEngine):
                 for t, arr in self._raster_cache.items()
             }
 
-        # 'vsa_opm': _upslope_area and _vsa_mask are already CuPy (built from
-        #             the CuPy faccum_1d / slope_1d in grid_data).
+        elif mode == 'vsa_opm':
+            # Nothing to do: the parent _init_vsa_opm uses gpu_utils.get_xp
+            # (CuPy here, since _upslope_area is CuPy) and already builds every
+            # per-cell/per-zone state array (incl. cell_polygon, Green-Ampt F,
+            # impervious fraction) on the GPU.
+
+            pass
+
         # 'none': stateless, nothing to do.
 
     # ── Overrides for SCS-CN (require cp.* ops) ───────────────────────────────
@@ -98,6 +104,10 @@ class RunoffEngineGPU(RunoffEngine):
         self._scs_rate_ms = (delta / 1000.0) / dt if dt > 0 \
             else cp.zeros(self._n_cells, dtype=np.float64)  # [m/s]
         self._Pe_mm_old = Pe_new
+
+    # NOTE: _update_opm_sandbox_per_polygon is no longer overridden.  The parent
+    # implementation is fully vectorised via gpu_utils.get_xp, so it runs natively
+    # on CuPy arrays (no per-zone Python loop, no D→H scalar transfers per step).
 
     # ── 2-D output override (GPU → CPU) ──────────────────────────────────────
 

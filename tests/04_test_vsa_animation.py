@@ -231,16 +231,22 @@ for step in range(n_steps):
 
         frame_times_hr.append(t_end_hr)
         frame_vsa_km2.append(diag.get("VSA_m2", 0.0) / 1e6)
-        frame_At_km2.append(diag.get("A_t_m2", 0.0) / 1e6)
-        frame_SD.append(diag.get("SD_max_t", config.OPM_SD_MAX_INITIAL))
-        frame_z.append(diag.get("z_m", 0.0))
+
+        # Per-polygon mode returns arrays; use mean for scalar time-series
+        _at = diag.get("A_t_m2", 0.0)
+        _sd = diag.get("SD_max_t", config.OPM_SD_MAX_INITIAL)
+        _zv = diag.get("z_m", 0.0)
+        frame_At_km2.append(float(np.mean(_at)) / 1e6 if hasattr(_at, '__len__') else _at / 1e6)
+        frame_SD.append(float(np.mean(_sd)) if hasattr(_sd, '__len__') else _sd)
+        frame_z.append(float(np.mean(_zv)) if hasattr(_zv, '__len__') else _zv)
 
         if (step // FRAME_EVERY_N_STEPS) % 10 == 0:
             vsa_frac = diag.get("VSA_m2", 0.0) / (cell_area * n_cells) * 100
+            _sd_disp = float(np.mean(_sd)) if hasattr(_sd, '__len__') else _sd
             print(f"  Frame {len(frame_depths):3d}  t={t_end_hr:.2f}h"
                   f"  Q={hydro_Q[-1]:.2f} m³/s"
                   f"  VSA={vsa_frac:.1f}%"
-                  f"  SD={diag.get('SD_max_t',0):.4f}m"
+                  f"  SD={_sd_disp:.4f}m"
                   f"  wall={time.time()-t_wall:.1f}s")
 
 n_frames = len(frame_depths)

@@ -2,6 +2,9 @@
 output/
 presentation/
 outputs collection/
+docs/
+tests/
+study/
 
 # Test data (large generated/downloaded files)
 test_data/
@@ -58,4 +61,23 @@ Thumbs.db
 .ipynb_checkpoints
 
 # GIS
+
+# Claude
 CLAUDE.md
+
+# Plugin build artifacts
+_plugin_build/
+qgis_plugin/
+vsa_opm_windows.zip
+
+# Scripts (local/env-specific)
+build_windows_plugin.sh
+install_plugin.sh
+setup_qgis_linux.sh
+
+# Server/service files
+serves.js
+serves_gee.py
+
+# Notes/scratch
+understand_formulas/
