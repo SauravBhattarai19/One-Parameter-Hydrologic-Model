@@ -2,6 +2,9 @@
 output/
 presentation/
 outputs collection/
+docs/
+tests/
+study/
 
 # Test data (large generated/downloaded files)
 test_data/

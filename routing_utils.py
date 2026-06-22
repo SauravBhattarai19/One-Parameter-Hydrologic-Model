@@ -271,6 +271,76 @@ def cell_discharge(depth, velocity, cell_size):
     return velocity * cell_size * depth
 
 
+def diffusive_wave_discharge(depth, dem, dist, slope_bnd, n, ds_safe, valid_ds,
+                             theta, cell_size, xp, min_depth):
+    """
+    CASC2D / GSSHA-style diffusion-wave cell discharge [m³/s].
+
+    Replaces the pure-kinematic ``mannings_velocity``→``cell_discharge`` pair when
+    ``ROUTING_SCHEME='diffusive'``.  The friction slope becomes the *water-surface*
+    slope along the D8 flow path, which lets the wave attenuate (peak flattening) and
+    slow under an adverse gradient — physics the bed-slope kinematic wave cannot capture.
+
+        S_w    = slope_bnd  +  θ · (h_i − h_ds)/dist               (water-surface slope)
+        S_eff  = max(S_w, 0)                                        (adverse grad → no flow)
+        h_hb   = max(WSE_i, WSE_ds) − max(z_i, z_ds)               (depth over higher bed)
+        h_flow = max( (1−θ)·h_i + θ·h_hb , min_depth )            (kinematic↔diffusion blend)
+        Q      = (1/n) · h_flow^(5/3) · S_eff^(1/2) · cell_size
+
+    θ blends BOTH the slope and the conveyance depth between the two coherent endpoints:
+    θ=0 → own depth + bed slope = the kinematic scheme *exactly*; θ=1 → flow-depth-over-the-
+    higher-bed + water-surface slope = the full CASC2D/GSSHA-style diffusion wave.  The bed
+    term is the existing ``slope_bnd`` (= ``slope_1d`` = (z_i−z_ds)/dist, already floored at
+    MIN_SLOPE with watershed-boundary handling), so steep cells get the true bed slope while
+    flat cells keep draining; the depth-gradient term can still drive S_w below zero → the
+    clamp reproduces backwater slowdown.  Cells with no valid downstream neighbour
+    (``~valid_ds`` — the outlet and any cell draining off-mask) keep ``slope_bnd`` and their
+    own depth, i.e. free outflow identical to the kinematic scheme.
+
+    All arithmetic is via ``xp`` (NumPy or CuPy) so the helper runs on CPU and GPU alike.
+
+    Parameters
+    ----------
+    depth     : (n,) array  – current flow depth per cell [m]
+    dem       : (n,) array  – bed elevation per cell [m]
+    dist      : (n,) array  – flow-path length to the downstream cell [m] (dx or dx·√2)
+    slope_bnd : (n,) array  – bed slope (used only for ~valid_ds free-outflow cells)
+    n         : scalar or (n,) array – Manning's n
+    ds_safe   : (n,) int array – downstream index, clamped to 0 where invalid
+    valid_ds  : (n,) bool array – True where the cell has a real downstream neighbour
+    theta     : float – diffusion weight θ∈[0,1]
+    cell_size : float – flow width ≈ cell size [m]
+    xp        : array module (numpy or cupy)
+    min_depth : float – wet/dry conveyance-depth floor [m]
+
+    Returns
+    -------
+    Q_out : (n,) array  [m³/s]  (NOT yet flux-limited — caller applies the CFL limiter)
+    """
+    depth_ds = depth[ds_safe]
+    dem_ds   = dem[ds_safe]
+
+    # Water-surface slope along the flow path: floored bed slope + θ depth-gradient term.
+    S_w = slope_bnd + theta * (depth - depth_ds) / dist
+    # Free-outflow cells (no downstream) fall back to the kinematic bed slope.
+    S_eff = xp.where(valid_ds, S_w, slope_bnd)
+    S_eff = xp.maximum(S_eff, 0.0)                       # adverse gradient → no discharge
+
+    # Conveyance depth: blend own depth (kinematic) with flow-depth-over-the-higher-bed
+    # (LISFLOOD-FP diffusion-wave convention) by the SAME θ as the slope, so the two terms
+    # stay a coherent pair — θ=0 → own depth + bed slope = kinematic exactly; θ=1 → higher-
+    # bed depth + water-surface slope = full diffusion wave.  In the normal downhill case
+    # the higher-bed depth already equals the upstream cell's own depth.
+    wse      = dem + depth
+    wse_ds   = wse[ds_safe]
+    h_higher = xp.maximum(wse, wse_ds) - xp.maximum(dem, dem_ds)
+    h_flow   = (1.0 - theta) * depth + theta * h_higher
+    h_flow   = xp.where(valid_ds, h_flow, depth)          # free-outflow cells: own depth
+    h_flow   = xp.maximum(h_flow, min_depth)
+
+    return (1.0 / n) * (h_flow ** (5.0 / 3.0)) * (S_eff ** 0.5) * cell_size
+
+
 def flux_limiter(Q_out, volume, dt):
     """
     Volume-conservative CFL limiter.

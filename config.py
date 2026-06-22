@@ -215,7 +215,7 @@ IMPERVIOUS_RASTER_PATH = None
 #   OPM_Q_MAX so the outlet hydrograph starts at baseflow instead of zero, making
 #   simulated hydrographs directly comparable to observed (gauged) discharge.
 #   False → hydrograph starts at 0 (original behaviour).
-OPM_BASEFLOW = True
+OPM_BASEFLOW = False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -282,8 +282,23 @@ CHANNEL_FACCUM_THRESHOLD = None
 # None → auto-detected from ROUTING_DEM_PATH at run-time (recommended).
 CELL_SIZE = None
 
+# ── Routing scheme ────────────────────────────────────────────────────────────
+# ROUTING_SCHEME:
+#   'kinematic' → Manning on the static bed slope S₀ (default; current behaviour,
+#                 bit-for-bit reproducible).
+#   'diffusive' → CASC2D/GSSHA-style diffusion wave: Manning on the *water-surface*
+#                 slope  S_w = (z_i−z_ds)/dist + θ·(h_i−h_ds)/dist, with conveyance on the
+#                 flow-depth-over-the-higher-bed.  Adds peak attenuation and adverse-
+#                 gradient slowdown along the drainage network.  Costs one extra
+#                 downstream gather per step (no Δx² penalty).
+ROUTING_SCHEME = 'diffusive'
+
+# DIFFUSION_THETA: diffusion weight θ∈[0,1] (used only when ROUTING_SCHEME='diffusive').
+#   0 → bed-slope-only (≈ kinematic)   |   1 → full water-surface-slope diffusion wave.
+DIFFUSION_THETA = 1.0
+
 # Δt must satisfy the Courant criterion: Δt ≤ CELL_SIZE / V_max
-TIME_STEP_SECONDS = 1
+TIME_STEP_SECONDS = 0.7
 
 # How often to record a hydrograph row (seconds of simulation time).
 # None → write every time step.
@@ -305,6 +320,12 @@ MAX_DEPTH_M = 10.0
 # ═════════════════════════════════════════════════════════════════════════════
 
 HYDROGRAPH_CSV = OUTPUT_DIR + "hydrograph.csv"
+
+# MASS_BALANCE_REPORT: the routing water budget (input − outflow − storage = error) is
+# ALWAYS computed and printed for every run/config as a correctness check.  When True,
+# also append one row to {OUTPUT_DIR}/mass_balance.csv.
+MASS_BALANCE_REPORT = True
+MASS_BALANCE_CSV    = OUTPUT_DIR + "mass_balance.csv"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -75,12 +75,25 @@ def run_router(config, gauge_csv: Path, ts_csv: Path, sim_hours: float,
 # Pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run():
+def run(output_dir=None, overrides=None, skip_process_dem=False):
+    """Run the gauge pipeline over every .gag event.
+
+    Parameters (all optional — defaults preserve standalone runner behaviour)
+    ------------------------------------------------------------------------
+    output_dir       : str — results folder (defaults to runner_config.OUTPUT_DIR).
+    overrides        : dict — {config_attr: value} applied AFTER the OUTPUT_DIR
+                       cascade, so a sweep can inject parameter values per run.
+    skip_process_dem : bool — reuse pre-seeded watershed rasters instead of
+                       re-deriving them (see common.run_process_dem).
+    """
     import gpu_utils
     import config
 
     # ONE folder for everything (overrides config.OUTPUT_DIR, cascades all paths).
-    out_dir    = apply_output_dir(config, rcfg.OUTPUT_DIR)
+    out_dir    = apply_output_dir(config, output_dir or rcfg.OUTPUT_DIR)
+    # Inject sweep parameter overrides AFTER the cascade so they take precedence.
+    for k, v in (overrides or {}).items():
+        setattr(config, k, v)
     output_dir = REPO_ROOT / out_dir.rstrip("/")
 
     gag_files = sorted(GSSHA_DIR.glob("*.gag"))
@@ -103,7 +116,7 @@ def run():
     print("\n" + "=" * 68)
     print("  STAGE 0 — process_dem  (CPU only, one-time)")
     print("=" * 68)
-    t_dem = run_process_dem(config, out_dir)
+    t_dem = run_process_dem(config, out_dir, skip_if_exists=skip_process_dem)
     print(f"\n  process_dem finished in  {hms(t_dem)}")
 
     all_metrics  = []
@@ -160,6 +173,7 @@ def run():
 
         # ── Stage 2: GPU routing ──────────────────────────────────────────────
         print(f"\n[2] GPU routing  (BACKEND='{BACKEND}')")
+        config.RUN_TAG = event_name   # tags mass_balance / partition CSV rows
         hydrograph, t_init, t_loop = run_router(
             config, gauge_csv, ts_csv, sim_hours,
             event_start_local=event_start,   # full NPT datetime → converted to UTC inside

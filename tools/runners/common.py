@@ -50,15 +50,26 @@ def apply_output_dir(config, out_dir):
     config.OPM_DEFICIT_RASTER          = None   # date-stamped per event in _resolve_sd_params
     config.PRECIP_IMERG_DIR            = out_dir + "imerg/"
     config.HYDROGRAPH_CSV              = out_dir + "hydrograph.csv"
+    config.MASS_BALANCE_CSV            = out_dir + "mass_balance.csv"
     return out_dir
 
 
-def run_process_dem(config, out_dir) -> float:
-    """Run process_dem once into *out_dir* (shared watershed for all events)."""
+def run_process_dem(config, out_dir, skip_if_exists=False) -> float:
+    """Run process_dem once into *out_dir* (shared watershed for all events).
+
+    When *skip_if_exists* is True and the four watershed rasters are already
+    present in *out_dir*, the (CPU-bound) DEM pipeline is skipped — this lets a
+    parameter sweep reuse one shared, pre-seeded watershed across every config.
+    """
     import os
     import time
     apply_output_dir(config, out_dir)
     os.makedirs(out_dir, exist_ok=True)
+    needed = [config.ROUTING_DEM_PATH, config.ROUTING_FLOW_DIR_PATH,
+              config.ROUTING_FLOW_ACCUM_PATH, config.ROUTING_WATERSHED_MASK_PATH]
+    if skip_if_exists and all(os.path.exists(p) for p in needed):
+        print("  [process_dem] watershed rasters already present — skipping.")
+        return 0.0
     import process_dem
     process_dem.OUTPUT_DIR = config.OUTPUT_DIR   # in case it was already imported
     t0 = time.perf_counter()

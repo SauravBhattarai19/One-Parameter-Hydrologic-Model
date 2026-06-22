@@ -371,6 +371,21 @@ class RunoffEngine:
         else:
             excess_frac = 0.0
         pervious_frac = xp.where(self._vsa_mask, 1.0, excess_frac)
+
+        # ── Mechanism decomposition (per-cell rates [m/s]) ───────────────────
+        # Stash the three runoff components so the router can accumulate the
+        # Dunne / Horton / impervious split.  By construction
+        #     imperv + dunne + horton == rain·(Imp + (1−Imp)·pervious_frac)
+        # i.e. they sum EXACTLY to the effective runoff returned below.
+        #   • impervious : urban shedding,            rain·Imp
+        #   • Dunne      : saturation-excess (in VSA), rain·(1−Imp)         on VSA cells
+        #   • Horton     : infiltration-excess,        rain·(1−Imp)·excess_frac off VSA
+        imp  = self._imperv_1d
+        perv = 1.0 - imp
+        self._last_imperv_rate = rain_1d * imp
+        self._last_dunne_rate  = rain_1d * perv * xp.where(self._vsa_mask, 1.0, 0.0)
+        self._last_horton_rate = rain_1d * perv * xp.where(self._vsa_mask, 0.0, excess_frac)
+
         return rain_1d * (self._imperv_1d
                           + (1.0 - self._imperv_1d) * pervious_frac)
 
