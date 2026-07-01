@@ -141,6 +141,21 @@ RUNOFF_SCS_Ia_FACTOR    = 0.2       # SCS initial abstraction ratio (standard 0.
 # 5.  OPM / VSA PARAMETERS  (used when RUNOFF_SOURCE = 'vsa_opm')
 # ═════════════════════════════════════════════════════════════════════════════
 
+# RUNOFF_MECHANISMS: which of the three runoff-generation mechanisms are active
+#   (used when RUNOFF_SOURCE='vsa_opm').  Include any subset — they are fully
+#   orthogonal, so this is the ONE place to compose the runoff model:
+#     'vsa'        → saturation-excess / Dunne (the OPM Variable Source Area)
+#     'horton'     → infiltration-excess via Green-Ampt (needs the OPM_GA_* params)
+#     'impervious' → urban shedding (needs IMPERVIOUS_SOURCE ≠ 'none')
+#   Effective runoff per cell:
+#     rain · [ Imp + (1 − Imp) · max(in_VSA, infil_excess_frac) ]
+#   with the in_VSA / excess / Imp terms switched on only when their mechanism is
+#   listed.  Examples: ['vsa','impervious'] → no Horton; ['impervious'] → urban
+#   only; [] → no hillslope runoff (router still moves any seeded/baseflow water).
+#   None / unset → legacy behaviour: VSA always on, Horton from OPM_INFILTRATION,
+#   impervious from IMPERVIOUS_SOURCE (fully backward compatible).
+RUNOFF_MECHANISMS = ['vsa', 'horton', 'impervious']
+
 # OPM_SD_MAX_INITIAL: root zone depth D — vertical height of the soil column
 #   at the catchment divide [m].  When OPM_SD_SOURCE='gee', overridden by SERVES.
 OPM_SD_MAX_INITIAL = 0.1    # m  (physical height, not water volume)
@@ -227,9 +242,20 @@ OPM_BASEFLOW = False
 #   'gee'    → SERVES deficit + LULC/LCZ root zone depth + SoilGrids porosity
 OPM_SD_SOURCE  = 'gee'
 
-# OPM_SD_REDUCER: how to aggregate the per-cell deficit per precipitation zone.
-#   'mean' → representative soil moisture  |  'max' → driest cell (divide proxy)
-OPM_SD_REDUCER = 'mean'
+# OPM_SD_REDUCER: how to turn the per-cell SERVES deficit into one SD_max per
+#   precipitation zone.  SD_max is the dominant control on the VSA, so this choice
+#   matters a lot:
+#     'mean'   → representative (zone-average) deficit; outlier-robust.
+#     'max'    → largest deficit in the zone = max soil-STORAGE-capacity cell.
+#                NOTE: deficit = (porosity − θ)·Z_r, so with variable root depth
+#                Z_r this is biased toward DEEP-ROOTED cells, not necessarily the
+#                driest soil — it is NOT a pure "driest cell" proxy.
+#     'divide' → deficit sampled AT each zone's divide cell (the topographic
+#                headwater where the sandbox water balance actually runs), so the
+#                SD_max ceiling is consistent with the sandbox.  Falls back to the
+#                zone max-finite deficit, then the watershed SD_max, if the divide
+#                cell has no SERVES data (cloud gap).
+OPM_SD_REDUCER = 'max'
 
 # Per-cell deficit raster (date-stamped per event by _resolve_sd_params).
 OPM_DEFICIT_RASTER = None   # None → auto-path: {OUTPUT_DIR}/deficit_serves_{date}.tif
@@ -295,14 +321,69 @@ ROUTING_SCHEME = 'diffusive'
 
 # DIFFUSION_THETA: diffusion weight θ∈[0,1] (used only when ROUTING_SCHEME='diffusive').
 #   0 → bed-slope-only (≈ kinematic)   |   1 → full water-surface-slope diffusion wave.
-DIFFUSION_THETA = 1.0
+DIFFUSION_THETA = 1
+
+# ── Channel (river) cross-section routing ─────────────────────────────────────
+# CHANNEL_ROUTING: when True, high-flow-accumulation "channel" cells are routed
+#   as a confined RECTANGULAR channel (width B ≪ cell_size, true hydraulic radius
+#   R = A/P) instead of a wide sheet spread over the whole DEM cell.  Hillslope
+#   (overland) cells are unchanged — they keep the wide-channel R ≈ depth shortcut,
+#   which is exact for a thin sheet over a 100 m cell.  Channel cells are the same
+#   cells flagged by CHANNEL_FACCUM_THRESHOLD (§7) for the Manning's-n override.
+#   False → original behaviour (every cell is a wide sheet of width = cell_size).
+CHANNEL_ROUTING = True
+
+# CHANNEL_WIDTH_BY_ORDER: channel width B [m] per Strahler stream order (computed
+#   from the D8 network).  Orders above the largest key reuse the largest key's
+#   width.  This basin's network spans orders 1–8 and the channel mask
+#   (CHANNEL_FACCUM_THRESHOLD, top ~1% of cells) selects roughly orders 4–8, so the
+#   table covers up to 8 — otherwise every main-stem cell would cap at the order-4
+#   width.  EDIT THESE to your basin (survey/imagery widths of the main
+#   Bagmati/Sundarijal channel); the defaults are a generic downstream-widening law.
+CHANNEL_WIDTH_BY_ORDER = {1: 3.0, 2: 5.0, 3: 8.0, 4: 12.0,
+                          5: 18.0, 6: 28.0, 7: 45.0, 8: 70.0}   # m
 
 # Δt must satisfy the Courant criterion: Δt ≤ CELL_SIZE / V_max
-TIME_STEP_SECONDS = 0.7
+# Used as the initial/fallback dt; ignored per-step when ADAPTIVE_TIMESTEP=True.
+TIME_STEP_SECONDS = 2
 
 # How often to record a hydrograph row (seconds of simulation time).
 # None → write every time step.
 OUTPUT_INTERVAL_SECONDS = 600
+
+# ── Adaptive CFL timestep ─────────────────────────────────────────────────────
+# ADAPTIVE_TIMESTEP: when True, dt is re-derived each step from the actual wave
+#   celerity c = (5/3)·V on the wet domain; False → static TIME_STEP_SECONDS.
+# CFL_TARGET: target Courant number; dt = CFL_TARGET·dx/c_max with the wave
+#   celerity c = (5/3)·Q/(h_flow·dx).  Pure advective CFL for BOTH schemes (a
+#   von Neumann diffusion-number term was tried and removed — D ∝ S_eff^(-1/2)
+#   pinned dt at the floor on flat-water cells; stability comes from the volume
+#   flux limiter, not from dt).
+#   TRADEOFF (first-order upwind, numerical diffusion D_num = (c·dx/2)(1−C)):
+#   higher C (→1) = less numerical diffusion = SHARPER, more physical peak, but
+#   more dispersive ripple; lower C = smoother but a damped/smeared peak.  With
+#   the interval-averaged hydrograph cleaning sub-step ripple, prefer C HIGH:
+#   0.7 is safe, try 0.85 for a sharper peak.  Watch the flux-limiter % — if it
+#   climbs you're too near C=1 (limiter engaging adds its own error).
+# CFL_DT_MAX: ceiling on dt [s]; None → OUTPUT_INTERVAL_SECONDS.
+#   Caps dt during dry/quiescent periods so the rising limb stays resolved.
+# CFL_DT_MIN: floor on dt [s]; flux limiter covers cells needing a smaller step.
+#   When it binds, a one-line warning + end-of-run count are printed.
+# WHY ADAPTIVE: a small static dt (≈0.9 s) over-diffuses (damps/smears the peak)
+#   and is slow; adaptive holds Courant near CFL_TARGET → a sharper, less-damped
+#   peak and far fewer steps.  The previous adaptive "saw-tooth" was NOT a routing
+#   instability — it was the hydrograph being point-sampled (instantaneous outlet
+#   rate) once per output step, which aliases sub-step dispersive ripples and the
+#   adaptive-dt jitter.  The outlet is now reported as the interval-MEAN flux
+#   (ΔV/Δt), which is mass-consistent and invariant to dt jitter → smooth.
+ADAPTIVE_TIMESTEP = True
+CFL_TARGET        = 0.85
+CFL_DT_MAX        = 5   # None → OUTPUT_INTERVAL_SECONDS
+CFL_DT_MIN        = 0.01   # [s]
+# CFL_DT_GROW: max factor by which adaptive dt may increase in one step.
+# Prevents oscillatory blow-up when c_max drops suddenly (GSSHA-style ramp-up).
+# 1.5 → dt=0.01s reaches 7s in ~17 steps; set to float('inf') to disable.
+CFL_DT_GROW       = 1.5
 
 # Minimum slope (m/m) — floor in Manning's to avoid division-by-zero on flat cells.
 MIN_SLOPE   = 1e-4

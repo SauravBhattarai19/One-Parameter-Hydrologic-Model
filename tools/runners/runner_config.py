@@ -32,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #       'imerg_idw'       IDW over IMERG pixel pseudo-gauges
 #
 # Set this one value; runner.py dispatches to the correct pipeline automatically.
-PRECIP_METHOD = "imerg_thiessen"
+PRECIP_METHOD = "thiessen"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -51,7 +51,7 @@ PRECIP_METHOD = "imerg_thiessen"
 #
 # This OVERRIDES config.OUTPUT_DIR for the batch run, so change the scenario
 # folder in this one place.  (Relative paths are resolved against the repo root.)
-OUTPUT_DIR = "outputs collection/100m_diff_inflt_imperv/imerg_100m_lcz"
+OUTPUT_DIR = "outputs collection/channel_different"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

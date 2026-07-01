@@ -271,8 +271,57 @@ def cell_discharge(depth, velocity, cell_size):
     return velocity * cell_size * depth
 
 
+def mannings_discharge(depth, slope, n, width, chan_mask, cell_size, xp):
+    """
+    Kinematic Manning discharge with an optional CONFINED rectangular channel
+    section on channel cells.
+
+    Overland cells (``chan_mask`` False) use the wide-channel shortcut R ≈ depth
+    and a flow width of ``cell_size`` — reproducing ``mannings_velocity`` followed
+    by ``cell_discharge`` *bit-for-bit* (same arithmetic, same grouping).  Channel
+    cells use a true rectangular cross-section of width ``B`` (≪ cell_size):
+
+        A   = B · h                       (cross-section area)
+        P   = B + 2·h                     (wetted perimeter)
+        R   = A / P = B·h/(B+2h)          (hydraulic radius; < h when B is finite)
+        Q   = (1/n) · R^(2/3) · √S · A    [m³/s]
+
+    Confining the flow to ``B`` instead of spreading it across the whole DEM cell
+    makes channel cells run deeper and faster (correct celerity / attenuation),
+    which the wide-sheet ``R ≈ depth`` assumption cannot capture.
+
+    Parameters
+    ----------
+    depth     : (n,) array – flow depth [m] (channel cells: depth over B·L footprint)
+    slope     : (n,) array – friction slope [m/m]
+    n         : scalar or (n,) array – Manning's n
+    width     : (n,) array – flow width [m]: cell_size overland, B on channel cells
+    chan_mask : (n,) bool array – True where the rectangular section applies
+    cell_size : float – DEM cell size [m] (overland width)
+    xp        : array module (numpy or cupy)
+
+    Returns
+    -------
+    Q    : (n,) array [m³/s]  – Manning discharge (pre flux-limiter)
+    A_xs : (n,) array [m²]    – flow cross-section area; celerity uses c = 5/3·Q/A_xs
+    """
+    # Overland (wide sheet): identical arithmetic to the original kinematic path.
+    velocity   = (1.0 / n) * (depth ** (2.0 / 3.0)) * (slope ** 0.5)
+    Q_overland = velocity * cell_size * depth
+    A_overland = depth * cell_size
+
+    # Channel (rectangular): true hydraulic radius R = A/P.
+    A_chan = depth * width
+    R_chan = A_chan / (width + 2.0 * depth)
+    Q_chan = (1.0 / n) * (R_chan ** (2.0 / 3.0)) * (slope ** 0.5) * A_chan
+
+    Q    = xp.where(chan_mask, Q_chan, Q_overland)
+    A_xs = xp.where(chan_mask, A_chan, A_overland)
+    return Q, A_xs
+
+
 def diffusive_wave_discharge(depth, dem, dist, slope_bnd, n, ds_safe, valid_ds,
-                             theta, cell_size, xp, min_depth):
+                             theta, cell_size, xp, min_depth, width, chan_mask):
     """
     CASC2D / GSSHA-style diffusion-wave cell discharge [m³/s].
 
@@ -312,10 +361,16 @@ def diffusive_wave_discharge(depth, dem, dist, slope_bnd, n, ds_safe, valid_ds,
     cell_size : float – flow width ≈ cell size [m]
     xp        : array module (numpy or cupy)
     min_depth : float – wet/dry conveyance-depth floor [m]
+    width     : (n,) array – flow width [m]: cell_size overland, channel width B on
+                             channel cells (CONFINED rectangular conveyance).
+    chan_mask : (n,) bool array – True where the rectangular section R=A/P applies.
 
     Returns
     -------
-    Q_out : (n,) array  [m³/s]  (NOT yet flux-limited — caller applies the CFL limiter)
+    Q_out  : (n,) array  [m³/s]  (NOT yet flux-limited — caller applies the CFL limiter)
+    A_xs   : (n,) array  [m²]    conveyance cross-section area; celerity denominator
+                                 (c = 5/3·Q/A_xs).  Overland: h_flow·cell_size.
+    S_eff  : (n,) array  [m/m]   effective (clamped) friction slope used for Q.
     """
     depth_ds = depth[ds_safe]
     dem_ds   = dem[ds_safe]
@@ -338,7 +393,21 @@ def diffusive_wave_discharge(depth, dem, dist, slope_bnd, n, ds_safe, valid_ds,
     h_flow   = xp.where(valid_ds, h_flow, depth)          # free-outflow cells: own depth
     h_flow   = xp.maximum(h_flow, min_depth)
 
-    return (1.0 / n) * (h_flow ** (5.0 / 3.0)) * (S_eff ** 0.5) * cell_size
+    # Conveyance discharge.  Overland (chan_mask False): wide sheet R≈h_flow,
+    # width=cell_size — identical arithmetic to the original diffusive path.
+    # Channel: confined rectangular section, true hydraulic radius R=A/P.
+    Q_overland = (1.0 / n) * (h_flow ** (5.0 / 3.0)) * (S_eff ** 0.5) * cell_size
+    A_overland = h_flow * cell_size
+
+    A_chan = h_flow * width
+    R_chan = A_chan / (width + 2.0 * h_flow)
+    Q_chan = (1.0 / n) * (R_chan ** (2.0 / 3.0)) * (S_eff ** 0.5) * A_chan
+
+    Q    = xp.where(chan_mask, Q_chan, Q_overland)
+    A_xs = xp.where(chan_mask, A_chan, A_overland)
+    # A_xs exposed so callers use the correct celerity denominator (c=5/3·Q/A_xs);
+    # S_eff exposed for diagnostics.
+    return Q, A_xs, S_eff
 
 
 def flux_limiter(Q_out, volume, dt):
@@ -776,3 +845,82 @@ def compute_strahler_order(ds_idx, n_cells):
                 max_count[ds] += 1
 
     return order
+
+
+# ---------------------------------------------------------------------------
+# 10.  Channel (river) cross-section geometry
+# ---------------------------------------------------------------------------
+
+def build_channel_geometry(cfg, grid_data):
+    """
+    Per-cell channel geometry for ``CHANNEL_ROUTING`` (Workstream 1).
+
+    Returns three NumPy arrays of shape ``(n_cells,)`` in topological order:
+
+      chan_mask_1d  : bool   – True on channel cells (faccum > threshold), the SAME
+                               cells the Manning's-n channel override uses.
+      width_1d      : float  – flow width [m]: ``cell_size`` on overland cells,
+                               a Strahler-order width (``CHANNEL_WIDTH_BY_ORDER``)
+                               on channel cells.
+      store_area_1d : float  – depth-from-volume denominator [m²]: ``cell_area`` on
+                               overland cells (depth = V/cell_area, unchanged), and
+                               ``width · flow-length`` on channel cells so depth is
+                               the channel-reach depth V/(B·L).
+
+    With ``CHANNEL_ROUTING`` False (or no channel cells / empty width table) every
+    value reduces to the wide-sheet defaults (width = cell_size, store_area =
+    cell_area), so routing is bit-for-bit unchanged.
+
+    Reuses the channel threshold convention from ``resolve_mannings_n`` and
+    ``compute_strahler_order`` for the network order — no new network analysis.
+    """
+    n_cells   = int(grid_data['n_cells'])
+    cell_size = float(grid_data['cell_size'])
+    cell_area = float(grid_data['cell_area'])
+    dist_1d   = np.asarray(grid_data['dist_1d'], dtype=np.float64)
+
+    width_1d      = np.full(n_cells, cell_size, dtype=np.float64)
+    store_area_1d = np.full(n_cells, cell_area, dtype=np.float64)
+    chan_mask_1d  = np.zeros(n_cells, dtype=bool)
+
+    if not getattr(cfg, 'CHANNEL_ROUTING', False):
+        return chan_mask_1d, width_1d, store_area_1d
+
+    # Channel mask: same faccum threshold as the Manning's-n channel override.
+    fa = grid_data['faccum_1d']
+    fa = fa.get() if hasattr(fa, 'get') else np.asarray(fa)
+    threshold = getattr(cfg, 'CHANNEL_FACCUM_THRESHOLD', None)
+    if threshold is None:
+        threshold = max(1, n_cells // 100)
+    chan_mask_1d = fa > threshold
+
+    width_by_order = getattr(cfg, 'CHANNEL_WIDTH_BY_ORDER', None)
+    if not width_by_order:
+        print("  [WARN] CHANNEL_ROUTING on but CHANNEL_WIDTH_BY_ORDER empty; "
+              "channel width defaults to cell_size (no confinement).")
+    else:
+        ds_idx = grid_data['ds_idx']
+        ds_np  = ds_idx.get() if hasattr(ds_idx, 'get') else np.asarray(ds_idx)
+        order  = compute_strahler_order(ds_np, n_cells)
+        max_o  = max(int(o) for o in width_by_order.keys())
+        # Strahler-order → width LUT (orders above max reuse max; unspecified
+        # intermediate orders keep cell_size = no confinement).
+        width_lut = np.full(max_o + 1, cell_size, dtype=np.float64)
+        for o, w in width_by_order.items():
+            if 0 <= int(o) <= max_o:
+                width_lut[int(o)] = float(w)
+        order_clip = np.minimum(order, max_o).astype(np.intp)
+        width_1d   = np.where(chan_mask_1d, width_lut[order_clip], width_1d)
+
+    # Channel storage footprint = width × channel length through the cell.
+    store_area_1d = np.where(chan_mask_1d, width_1d * dist_1d, store_area_1d)
+
+    n_chan = int(chan_mask_1d.sum())
+    if n_chan:
+        wch = width_1d[chan_mask_1d]
+        print(f"  Channel routing|  {n_chan:,}/{n_cells:,} cells "
+              f"(faccum>{threshold:g})  width=[{wch.min():.1f}, {wch.max():.1f}] m")
+    else:
+        print(f"  Channel routing|  no cells exceed faccum threshold "
+              f"{threshold:g}; routing as wide sheet everywhere.")
+    return chan_mask_1d, width_1d, store_area_1d

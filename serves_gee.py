@@ -114,6 +114,12 @@ def _authenticate(project=None):
     init_kw = {'project': proj} if proj else {}
 
     sa_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+    if not sa_path:
+        # Non-interactive shells (conda run, HPC) don't source ~/.bashrc, so the
+        # env var may be absent.  Fall back to key.json next to this file.
+        _candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'key.json')
+        if os.path.isfile(_candidate):
+            sa_path = _candidate
     if sa_path and os.path.isfile(sa_path):
         try:
             credentials = ee.ServiceAccountCredentials(None, sa_path)

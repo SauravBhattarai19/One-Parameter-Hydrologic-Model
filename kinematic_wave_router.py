@@ -137,6 +137,14 @@ def initialise_grid(cfg):
     n_1d = ru.resolve_mannings_n(cfg, grid_data)
     grid_data["n_1d"] = n_1d
 
+    # ── Channel (river) cross-section geometry ──────────────────────────────
+    # Wide-sheet defaults (cell_size / cell_area) unless CHANNEL_ROUTING is on, in
+    # which case high-faccum channel cells get a confined rectangular section.
+    chan_mask_1d, width_1d, store_area_1d = ru.build_channel_geometry(cfg, grid_data)
+    grid_data["chan_mask_1d"]  = chan_mask_1d
+    grid_data["width_1d"]      = width_1d
+    grid_data["store_area_1d"] = store_area_1d
+
     # ── Transfer hot arrays to GPU (must happen BEFORE engine construction) ───
     # Engines read grid_data['faccum_1d'] and grid_data['slope_1d'] during
     # __init__; they must already be CuPy arrays so engine state is on GPU.
@@ -148,12 +156,18 @@ def initialise_grid(cfg):
         n_1d      = gpu_utils.to_device(n_1d.astype(_dtype),       xp)
         dem_1d    = gpu_utils.to_device(dem_1d.astype(_dtype),     xp)
         dist_1d   = gpu_utils.to_device(dist_1d.astype(_dtype),    xp)
+        width_1d      = gpu_utils.to_device(width_1d.astype(_dtype),      xp)
+        store_area_1d = gpu_utils.to_device(store_area_1d.astype(_dtype), xp)
+        chan_mask_1d  = gpu_utils.to_device(chan_mask_1d,                 xp)
         grid_data["slope_1d"]  = slope_1d
         grid_data["ds_idx"]    = ds_idx
         grid_data["faccum_1d"] = faccum_1d
         grid_data["n_1d"]      = n_1d
         grid_data["dem_1d"]    = dem_1d
         grid_data["dist_1d"]   = dist_1d
+        grid_data["width_1d"]      = width_1d
+        grid_data["store_area_1d"] = store_area_1d
+        grid_data["chan_mask_1d"]  = chan_mask_1d
 
     grid_data["xp"] = xp   # carried into run_time_loop
 
@@ -194,21 +208,31 @@ def run_time_loop(grid_data, cfg):
     -------
     hydrograph : list of (time_s, Q_out_m3s) tuples
     """
-    dt        = cfg.TIME_STEP_SECONDS
-    n_steps   = int(cfg.TOTAL_SIMULATION_TIME_HOURS * 3600.0 / dt)
     n         = grid_data.get("n_1d", cfg.MANNINGS_N)
-
-    # Output write frequency: every N steps (rounded up to at least 1)
-    _out_interval = getattr(cfg, 'OUTPUT_INTERVAL_SECONDS', None)
-    write_every   = max(1, round((_out_interval or dt) / dt))
     cell_area = grid_data["cell_area"]
     dx        = grid_data["cell_size"]
+    T         = cfg.TOTAL_SIMULATION_TIME_HOURS * 3600.0
+
+    # Adaptive CFL parameters
+    adaptive      = getattr(cfg, 'ADAPTIVE_TIMESTEP', True)
+    cfl_target    = float(getattr(cfg, 'CFL_TARGET', 0.8))
+    _cfl_dt_max   = getattr(cfg, 'CFL_DT_MAX', None)
+    _out_interval = float(getattr(cfg, 'OUTPUT_INTERVAL_SECONDS', None)
+                          or cfg.TIME_STEP_SECONDS)
+    cfl_dt_max    = float(_cfl_dt_max) if _cfl_dt_max is not None else _out_interval
+    cfl_dt_min    = float(getattr(cfg, 'CFL_DT_MIN', 0.01))
+    cfl_dt_grow   = float(getattr(cfg, 'CFL_DT_GROW', 1.5))
+    dt            = cfg.TIME_STEP_SECONDS   # legacy dt / adaptive seed
+    n_steps       = int(T / dt)             # reference value for legacy-mode header
 
     s_rows         = grid_data["s_rows"]
     s_cols         = grid_data["s_cols"]
     slope_1d       = grid_data["slope_1d"]
     dem_1d         = grid_data["dem_1d"]
     dist_1d        = grid_data["dist_1d"]
+    width_1d       = grid_data["width_1d"]        # flow width [m] (channel cross-section)
+    store_area_1d  = grid_data["store_area_1d"]   # depth-from-volume footprint [m²]
+    chan_mask_1d   = grid_data["chan_mask_1d"]    # True on confined channel cells
     ds_idx         = grid_data["ds_idx"]
     n_cells        = grid_data["n_cells"]
     outlet_pos     = grid_data["outlet_pos"]
@@ -229,9 +253,10 @@ def run_time_loop(grid_data, cfg):
     _dtype = gpu_utils.get_dtype(cfg)
 
     # State arrays on the correct device (CPU or GPU)
-    volume_1d = xp.zeros(n_cells, dtype=_dtype)   # [m³]  water stored per cell
-    Q_out_1d  = xp.zeros(n_cells, dtype=_dtype)   # [m³/s] outflow at previous step
-    inflow_1d = xp.zeros(n_cells, dtype=_dtype)   # [m³/s] upstream inflow buffer
+    volume_1d     = xp.zeros(n_cells, dtype=_dtype)   # [m³]   water stored per cell
+    Q_out_1d      = xp.zeros(n_cells, dtype=_dtype)   # [m³/s] outflow rate (for hydrograph)
+    Q_out_vol_1d  = xp.zeros(n_cells, dtype=_dtype)   # [m³]   outflow VOLUME last step
+    inflow_vol_1d = xp.zeros(n_cells, dtype=_dtype)   # [m³]   upstream inflow volume this step
 
     hydrograph = []  # list of (time_seconds, Q_m3s) — Python floats
 
@@ -245,27 +270,48 @@ def run_time_loop(grid_data, cfg):
         print(f"  Baseflow offset added to outlet: {q_base:.3f} m³/s")
 
     print("=" * 60)
-    print(f"TIME LOOP  |  steps={n_steps:,}  dt={dt}s  "
-          f"sim={cfg.TOTAL_SIMULATION_TIME_HOURS}h")
+    if adaptive:
+        print(f"TIME LOOP  |  adaptive CFL  |  C_target={cfl_target}  "
+              f"dt_max={cfl_dt_max:.0f}s  dt_min={cfl_dt_min}s  "
+              f"dt_grow={cfl_dt_grow:.1f}×  sim={cfg.TOTAL_SIMULATION_TIME_HOURS}h")
+    else:
+        print(f"TIME LOOP  |  static dt  |  steps={n_steps:,}  dt={dt}s  "
+              f"sim={cfg.TOTAL_SIMULATION_TIME_HOURS}h")
     print("=" * 60)
 
-    # ── Courant number check ─────────────────────────────────────────────────
-    # For a 1 m deep cell at the steepest slope, compute V and the Courant number.
-    # If C > 1, the explicit scheme is conditionally unstable and the flux
-    # limiter is critical. Print an advisory so the user can reduce dt if needed.
-    # Use .item() so the comparison works for both CuPy and NumPy scalars.
-    max_slope         = float(slope_1d.max().item())
-    n_min             = float(n.min().item()) if hasattr(n, 'min') else float(n)
-    V_at_1m_max_slope = (1.0 / n_min) * (1.0 ** (2.0 / 3.0)) * (max_slope ** 0.5)
-    C_indicator       = V_at_1m_max_slope * dt / dx
-    safe_dt           = dx / V_at_1m_max_slope
-    if C_indicator > 1.0:
-        print(f"  [CFL WARNING] Courant indicator C={C_indicator:.2f} > 1 at steepest slope.")
-        print(f"  Flux limiter is ACTIVE. For unconditionally stable runs, "
-              f"set TIME_STEP_SECONDS ≤ {safe_dt:.1f} s")
+    # ── One-time CFL diagnostic (celerity = 5/3·V for Manning wide channel) ──
+    # The kinematic wave speed is c = (5/3)·V, not V — using V alone under-counts
+    # the Courant number by 5/3.  This corrected check is informational only;
+    # the adaptive loop tracks actual instantaneous celerity at each step.
+    max_slope  = float(slope_1d.max().item())
+    n_min      = float(n.min().item()) if hasattr(n, 'min') else float(n)
+    V_at_1m    = (1.0 / n_min) * (1.0 ** (2.0 / 3.0)) * (max_slope ** 0.5)
+    c_at_1m    = (5.0 / 3.0) * V_at_1m          # wave celerity at 1 m depth [m/s]
+    c_safe_dt  = dx / c_at_1m
+    if adaptive:
+        print(f"  [CFL] Steepest-slope celerity (1 m depth): c={c_at_1m:.2f} m/s  "
+              f"→ CFL-safe dt={c_safe_dt:.2f}s  (adaptive loop will track this)")
     else:
-        print(f"  [CFL OK] Courant indicator C={C_indicator:.2f} at steepest slope.")
+        c_fixed = c_at_1m * dt / dx
+        if c_fixed > 1.0:
+            print(f"  [CFL WARNING] Celerity-based Courant C={c_fixed:.2f} > 1.  "
+                  f"Flux limiter is ACTIVE.  Set TIME_STEP_SECONDS ≤ {c_safe_dt:.2f}s")
+        else:
+            print(f"  [CFL OK] Celerity-based Courant C={c_fixed:.2f} ≤ 1.")
     print()
+
+    # ── Adaptive-loop state (also used for step-tracking in legacy mode) ──────
+    _eps         = 1e-9    # time-axis guard: stop before T + _eps
+    _eps_div     = 1e-12   # division guard for celerity (depth · dx)
+    t_seconds    = 0.0
+    step_count   = 0
+    cfl_min_bind = 0
+    _dt_sum      = 0.0
+    _dt_min_seen = float('inf')
+    _dt_max_seen  = 0.0
+    _dt_cfl_prev  = cfl_dt_max   # unclamped CFL dt from previous step (growth-limiter seed)
+    next_output_t   = _out_interval
+    next_progress_t = T / 10.0
 
     # ── Pre-compute static scatter-add masks (ds_idx never changes) ──────────
     valid_ds      = ds_idx >= 0         # mask: cell has a valid downstream neighbour
@@ -280,6 +326,10 @@ def run_time_loop(grid_data, cfg):
     mb_out  = xp.zeros((), dtype=_dtype)   # Σ volume leaving the domain at boundary cells [m³]
     mb_rain = xp.zeros((), dtype=_dtype)   # Σ gross rainfall volume [m³] (for runoff ratio)
 
+    # Flux-limiter engagement diagnostic: max per-step fraction of wet cells clipped.
+    # Device 0-d scalar (xp.maximum each step), transferred to host once at the end.
+    _frac_clip_max_dev = xp.zeros((), dtype=_dtype)
+
     # ── Runoff-mechanism partition (vsa_opm only) ────────────────────────────
     # Σ effective-runoff volume by generating mechanism [m³].  The three sum
     # EXACTLY to mb_in (effective runoff IN) by construction in the engine.
@@ -291,20 +341,38 @@ def run_time_loop(grid_data, cfg):
     partition_series = []   # (time_hr, cum_dunne_m3, cum_horton_m3, cum_imperv_m3)
 
     Q_outlet     = 0.0                  # initialise for progress reporting
+    # Interval-averaged outlet hydrograph: accumulate the volume that leaves the
+    # outlet each step (device scalar, no per-step host sync) and report
+    # accumulated-volume / interval at each output time.  This is the physically
+    # correct hydrograph quantity (mean flux = ΔV/Δt, mass-consistent) and removes
+    # the aliasing of sub-step dispersive ripples / adaptive-dt jitter that makes a
+    # point-sampled instantaneous Q_out look like a saw-tooth at the output cadence.
+    _out_vol_dev = xp.zeros((), dtype=_dtype)   # Σ outlet outflow volume this interval [m³]
+    _last_out_t  = 0.0                          # interval start time [s]
     t_wall_start = time.time()
 
-    for step in range(n_steps):
-        t_seconds = step * dt  # simulation time at the START of this step
+    while t_seconds < T - _eps:
+
+        # Non-adaptive: reset dt to the configured value each iteration so that
+        # output-boundary clamping (below) only shortens THIS step, not all future
+        # ones.  Without this, dt would "stick" at the clamped value permanently
+        # (e.g. 0.9 → 0.6 after the first 600s boundary → 50% more steps).
+        if not adaptive:
+            dt = cfg.TIME_STEP_SECONDS
 
         # ── 1. Rainfall array for this step ──────────────────────────────────
         rain_1d = precip_engine.get_field_1d(t_seconds)   # [m/s], (n_cells,)
 
-        # ── 2. Inflow buffer: accumulates Q_out from upstream cells ──────────
-        # Reuse the pre-allocated buffer — fill(0) avoids per-step allocation.
-        # gpu_utils.scatter_add dispatches to cupyx.scatter_add (GPU) or
-        # numpy.add.at (CPU); both are atomic-safe.
-        inflow_1d.fill(0)
-        gpu_utils.scatter_add(inflow_1d, ds_positions, Q_out_1d[valid_ds])
+        # ── 2. Inflow buffer: accumulates VOLUME (not rate) from upstream cells ─
+        # We scatter-add Q_out_vol_1d [m³] — the volume that left each upstream
+        # cell in the previous step — not the rate Q_out [m³/s].  This is the
+        # critical invariant for variable-dt correctness: inflow volume is fixed
+        # at what the upstream step actually computed, independent of dt_current.
+        # (If we scattered rates and multiplied by dt_current, a dt jump from
+        # 0.01s to 7s would inject 700× a cell's water into its downstream
+        # neighbour, causing the observed blow-up to ~500K m³/s.)
+        inflow_vol_1d.fill(0)
+        gpu_utils.scatter_add(inflow_vol_1d, ds_positions, Q_out_vol_1d[valid_ds])
 
         # ── 3. Update each cell (vectorised) ─────────────────────────────────
         #
@@ -317,7 +385,10 @@ def run_time_loop(grid_data, cfg):
         #   - Then V is advanced with that Q_out
         # This is the standard explicit kinematic-wave approach.
 
-        depth_1d = xp.maximum(volume_1d / cell_area, cfg.MIN_DEPTH_M)   # [m]
+        # Depth from stored volume over the cell's storage footprint.  Overland:
+        # store_area = cell_area → depth = V/cell_area (unchanged).  Channel cells:
+        # store_area = B·L → depth = V/(B·L) = channel-reach depth (confined, deeper).
+        depth_1d = xp.maximum(volume_1d / store_area_1d, cfg.MIN_DEPTH_M)   # [m]
         # Floor only — no ceiling. A depth cap freezes Manning Q at the cap
         # value while volume keeps growing, creating a permanent flat plateau.
         # The flux limiter already prevents numerical runaway; deeper cells
@@ -326,17 +397,83 @@ def run_time_loop(grid_data, cfg):
         if scheme == 'diffusive':
             # Diffusion wave: Manning on the water-surface slope along the flow path,
             # with conveyance on the flow-depth-over-the-higher-bed (CASC2D/GSSHA-style).
-            Q_out_1d = ru.diffusive_wave_discharge(
+            # Returns (Q, A_xs, S_eff); channel cells use a confined rectangular section.
+            Q_out_1d, A_xs_1d, S_eff_1d = ru.diffusive_wave_discharge(
                 depth_1d, dem_1d, dist_1d, slope_1d, n, ds_safe, valid_ds,
-                theta, dx, xp, cfg.MIN_DEPTH_M,
-            )                                                          # [m³/s]
+                theta, dx, xp, cfg.MIN_DEPTH_M, width_1d, chan_mask_1d,
+            )                                                          # [m³/s], [m²], [m/m]
         else:
-            velocity_1d = ru.mannings_velocity(depth_1d, slope_1d, n)  # [m/s]
-            Q_out_1d    = ru.cell_discharge(depth_1d, velocity_1d, dx) # [m³/s]
+            # Kinematic wave: Manning on the bed slope.  Channel cells use the
+            # confined rectangular section (R=A/P); overland cells reproduce the
+            # original mannings_velocity·cell_discharge bit-for-bit.
+            Q_out_1d, A_xs_1d = ru.mannings_discharge(
+                depth_1d, slope_1d, n, width_1d, chan_mask_1d, dx, xp)  # [m³/s], [m²]
+            S_eff_1d    = slope_1d   # bed slope; makes the combined limit reduce to pure CFL
+        # ── Adaptive CFL dt (state^n → dt^n, computed before volume advance) ──
+        if adaptive:
+            # Wave celerity c = (5/3)·Q/A_xs, using the flow cross-section area A_xs
+            # returned by the discharge function (overland: h_flow·cell_size; channel:
+            # h_flow·B).  Using A_xs — not depth_1d·dx — keeps the celerity consistent
+            # with the conveyance section: for the diffusive scheme A_xs is built from
+            # h_flow = h_higher (depth over the higher bed), and for channel cells from
+            # the confined width B, so dt tracks the true wave speed in both.
+            c_1d   = (5.0 / 3.0) * Q_out_1d / xp.maximum(A_xs_1d, _eps_div)
+            # Advective CFL only.  A von Neumann diffusion-number limit
+            # (dt ≤ ½dx²/D, D = Q/(2·dx·S_eff) = h_flow^(5/3)/(2n·√S_eff)) was tried
+            # and REMOVED: D ∝ S_eff^(-1/2) blows up on the always-present flat-water
+            # cells (ponding / backwater / saturated VSA), pinning dt at CFL_DT_MIN
+            # for the whole run with NO accuracy benefit.  Stability of this scheme
+            # comes from the nonlinear volume flux limiter (Q ≤ V/dt) + the
+            # S_eff=max(·,0) clamp, NOT from a linear-stability dt: static dt=0.9s
+            # violates the diffusion-number bound yet is stable and accurate because
+            # the limiter bounds the solution.  For the diffusive scheme dt is an
+            # ACCURACY knob — prefer ADAPTIVE_TIMESTEP=False with a modest TIME_STEP.
+            inv_dt     = c_1d / dx
+            inv_dt_max = float(inv_dt.max().item())
+            dt_new     = cfl_target / max(inv_dt_max, _eps_div)
+            dt_new     = min(dt_new, cfl_dt_max)
+            # Growth limiter (GSSHA-style): dt may shrink instantly but can grow by at
+            # most cfl_dt_grow per step.  Without this, a sudden c_max drop (e.g. after
+            # a CFL_DT_MIN-bound peak) causes dt to jump 700× in one step, dumping a
+            # huge volume pulse downstream and creating oscillatory instability.
+            # From dt=0.01s to dt=7s with grow=1.5 takes ~17 steps — smooth ramp-up.
+            dt_new = min(dt_new, _dt_cfl_prev * cfl_dt_grow)
+            if dt_new < cfl_dt_min:
+                cfl_min_bind += 1
+                if cfl_min_bind == 1:
+                    print(f"  [CFL_DT_MIN] First bind at t={t_seconds/3600:.3f}h "
+                          f"(dt_adaptive={dt_new:.4f}s < {cfl_dt_min}s) — "
+                          f"flux limiter engaged for fast cells")
+                dt_new = cfl_dt_min
+            _dt_cfl_prev = dt_new   # save post-floor, pre-clamp CFL dt for next growth limit
+            dt = dt_new
+
+        # Clamp to land exactly on output-record boundaries and simulation end.
+        # This keeps the hydrograph on a clean regular time axis and ensures the
+        # final step reaches T without overshoot.
+        dt = min(dt, next_output_t - t_seconds, T - t_seconds)
+        dt = max(dt, _eps)
+
         # Apply volume-conservative CFL limiter: a cell cannot eject more
         # water than it stores in one time step (prevents Courant runaway).
         # Inlined with xp.minimum/xp.maximum so it works on both CPU and GPU.
-        Q_out_1d = xp.minimum(Q_out_1d, xp.maximum(volume_1d, 0.0) / dt)
+        # Diagnostic: the limiter is meant to be a RARE safety net.  When the dt
+        # controller keeps the scheme inside its stability envelope only a handful
+        # of pathological cells should ever clip; a large clipped fraction signals
+        # dt is too aggressive (artificial diffusion / outlet ringing).
+        # On-device scalars (transferred to host once at the end, like the
+        # mass-balance accumulators) so the hot loop stays sync-free on GPU.
+        _q_cap     = xp.maximum(volume_1d, 0.0) / dt
+        _wet       = volume_1d > 0.0
+        _n_wet     = _wet.sum()
+        _n_clipped = ((Q_out_1d > _q_cap) & _wet).sum()
+        _frac_clip = _n_clipped / xp.maximum(_n_wet, 1)
+        _frac_clip_max_dev = xp.maximum(_frac_clip_max_dev, _frac_clip)
+        Q_out_1d = xp.minimum(Q_out_1d, _q_cap)
+
+        # Convert outflow rate → volume for this step.  This is the value that
+        # the NEXT step's scatter-add will use — decoupled from dt_next.
+        Q_out_vol_1d = Q_out_1d * dt                 # [m³] outflow volume this step
 
         # Volume advance
         # If a RunoffEngine is active, convert rainfall to effective runoff first
@@ -356,47 +493,76 @@ def run_time_loop(grid_data, cfg):
         rain_vol   = source_1d * cell_area * dt      # [m³] effective runoff added
         volume_1d  = (volume_1d
                       + rain_vol
-                      + inflow_1d * dt
-                      - Q_out_1d  * dt)
+                      + inflow_vol_1d               # [m³] pre-computed upstream volume
+                      - Q_out_vol_1d)               # [m³] pre-computed outflow volume
         volume_1d  = xp.maximum(volume_1d, 0.0)     # no negative storage
 
         # ── Mass-balance accumulation (device reductions; transferred once at end) ──
-        mb_in   += rain_vol.sum()                       # effective runoff entering routing
-        mb_out  += (Q_out_1d * boundary_f).sum() * dt   # routed volume leaving the domain
-        mb_rain += rain_1d.sum() * (cell_area * dt)      # gross rainfall (for runoff ratio)
+        mb_in   += rain_vol.sum()                              # effective runoff entering routing
+        mb_out  += (Q_out_vol_1d * boundary_f).sum()          # volume leaving the domain [m³]
+        mb_rain += rain_1d.sum() * (cell_area * dt)           # gross rainfall (for runoff ratio)
+        _out_vol_dev += Q_out_vol_1d[outlet_pos]              # outlet outflow volume this step [m³]
+
+        # ── Advance simulation time and accumulate step statistics ───────────
+        t_seconds    += dt
+        step_count   += 1
+        _dt_sum      += dt
+        _dt_min_seen  = min(_dt_min_seen, dt)
+        _dt_max_seen  = max(_dt_max_seen, dt)
 
         # ── 4. Record outlet hydrograph (at output interval, not every step) ───
-        # Evaluate Q_outlet only when needed to minimise GPU→CPU transfers.
-        _need_q = (
-            (step + 1) % write_every == 0
-            or step == n_steps - 1
-            or (step + 1) % max(1, n_steps // 10) == 0
-        )
-        if _need_q:
+        # Both triggers share the single D→H transfer when both fire on one step.
+        _at_output   = t_seconds >= next_output_t - _eps or t_seconds >= T - _eps
+        _at_progress = t_seconds >= next_progress_t - _eps
+        if _at_output:
+            # Interval-mean discharge = Σ outlet volume this interval / interval length.
             # .item() converts CuPy 0-d → Python float (8-byte D→H); no-op on NumPy.
+            _interval = t_seconds - _last_out_t
+            Q_outlet  = float(_out_vol_dev.item()) / max(_interval, _eps) + q_base
+            _out_vol_dev.fill(0)            # reset accumulator for the next interval
+            _last_out_t = t_seconds
+        elif _at_progress:
+            # Console-only: instantaneous rate is fine for the progress line.
             Q_outlet = float(Q_out_1d[outlet_pos].item()) + q_base
 
-        if (step + 1) % write_every == 0 or step == n_steps - 1:
-            hydrograph.append((t_seconds + dt, Q_outlet))
+        if _at_output:
+            hydrograph.append((t_seconds, Q_outlet))
             if _partition:
                 # Cumulative mechanism volumes [m³] at the hydrograph cadence —
                 # one D→H transfer per recorded row (cheap, same rate as Q).
                 partition_series.append((
-                    (t_seconds + dt) / 3600.0,
+                    t_seconds / 3600.0,
                     float(mb_dunne.item()),
                     float(mb_horton.item()),
                     float(mb_imperv.item()),
                 ))
+            next_output_t += _out_interval
 
         # Progress reporting every 10 % of simulation
-        if (step + 1) % max(1, n_steps // 10) == 0:
+        if _at_progress:
             elapsed = time.time() - t_wall_start
-            pct     = 100.0 * (step + 1) / n_steps
+            pct     = 100.0 * t_seconds / T
             print(f"  {pct:5.1f}%  |  t={t_seconds/3600:.3f}h  "
                   f"|  Q_outlet={Q_outlet:.4f} m³/s  "
                   f"|  wall={elapsed:.1f}s")
+            next_progress_t += T / 10.0
 
-    print(f"\n  Simulation finished in {time.time()-t_wall_start:.1f}s")
+    _wall_total = time.time() - t_wall_start
+    _dt_mean    = _dt_sum / step_count if step_count > 0 else 0.0
+    print(f"\n  Simulation finished in {_wall_total:.1f}s  |  "
+          f"{step_count:,} steps  |  "
+          f"dt mean={_dt_mean:.2f}s  min={_dt_min_seen:.3f}s  max={_dt_max_seen:.1f}s")
+    if adaptive and cfl_min_bind > 0:
+        print(f"  [CFL_DT_MIN] Bound {cfl_min_bind} times — "
+              f"flux limiter engaged for pathological fast cells")
+    # Flux-limiter engagement: a stable dt keeps this near zero; a large peak
+    # fraction means the limiter (not the wave equation) is doing the routing,
+    # i.e. dt is too aggressive for the chosen scheme.
+    _frac_clip_max = float(_frac_clip_max_dev.item())
+    print(f"  Flux limiter   |  peak {100.0*_frac_clip_max:.2f}% of wet cells clipped in a step")
+    if _frac_clip_max > 0.02:
+        print(f"  [WARNING] Flux limiter clipped >2% of wet cells — dt is marginal; "
+              f"lower CFL_TARGET or (static mode) TIME_STEP_SECONDS.")
 
     # ── Mass balance ─────────────────────────────────────────────────────────
     # Budget on the routed water:  INPUT − OUTFLOW − STORAGE = ERROR.
@@ -405,7 +571,7 @@ def run_time_loop(grid_data, cfg):
     # routing lag, not yet scattered downstream).  Accounting for it makes the budget
     # close to machine precision when the scheme is conservative — so any non-trivial
     # error is a genuine red flag rather than a loop-boundary artefact.
-    inflight   = float((Q_out_1d[valid_ds].sum()).item()) * dt
+    inflight   = float((Q_out_vol_1d[valid_ds].sum()).item())   # already [m³]
     storage    = float(volume_1d.sum().item()) + inflight
     input_m3   = float(mb_in.item())
     outflow_m3 = float(mb_out.item())

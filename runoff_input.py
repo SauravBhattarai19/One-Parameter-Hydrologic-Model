@@ -163,15 +163,25 @@ def _resolve_sd_params(cfg, cell_size):
 
 
 def _per_zone_sd_from_raster(deficit_path, cell_polygon, n_polygons,
-                             s_rows, s_cols, reducer, sd_min, ws_default):
+                             s_rows, s_cols, reducer, sd_min, ws_default,
+                             divide_idx=None):
     """
     Reduce the per-cell deficit raster into one SD_max per precipitation zone.
 
-    For each zone p, SD_max[p] = mean|max of the deficit over ONLY the watershed
-    cells that zone owns (cell_polygon == p) — the exact same nearest-station
-    partition the rainfall uses.  Zones with no deficit data (or out-of-basin
-    stations that own no cells) get *ws_default* (the watershed SD_max).  The
-    result is therefore watershed-bounded and consistent with the rain zoning.
+    Reducer modes (``OPM_SD_REDUCER``):
+      'mean'   – zone-average deficit (representative; outlier-robust).
+      'max'    – largest deficit in the zone (max soil-STORAGE-capacity cell;
+                 biased toward deep-rooted cells via Z_r, not pure dryness).
+      'divide' – deficit sampled AT the zone's divide cell (``divide_idx[p]``), so
+                 the SD_max ceiling is measured where the OPM sandbox actually runs.
+                 Falls back to that zone's max-finite deficit, then *ws_default*,
+                 when the divide cell has no SERVES data (cloud gap).
+
+    For 'mean'/'max', SD_max[p] is reduced over ONLY the watershed cells that zone
+    owns (cell_polygon == p) — the exact same nearest-station partition the
+    rainfall uses.  Zones with no deficit data (or out-of-basin stations that own
+    no cells) get *ws_default* (the watershed SD_max).  The result is therefore
+    watershed-bounded and consistent with the rain zoning.
     """
     with rasterio.open(deficit_path) as src:
         deficit2d = src.read(1).astype(np.float64)
@@ -190,8 +200,22 @@ def _per_zone_sd_from_raster(deficit_path, cell_polygon, n_polygons,
 
     deficit_1d = deficit2d[sr, sc]                 # (n_cells,) deficit per cell
     finite     = np.isfinite(deficit_1d)
-    redux      = np.max if reducer == 'max' else np.mean
 
+    if reducer == 'divide' and divide_idx is not None:
+        div = _to_np(divide_idx).astype(np.intp)
+        sd  = np.full(n_polygons, ws_default, dtype=np.float64)
+        for p in range(n_polygons):
+            v = deficit_1d[div[p]]
+            if np.isfinite(v):
+                sd[p] = float(v)                       # deficit at the divide cell
+            else:
+                m = (cell_polygon == p) & finite       # fallback: zone max-finite
+                if m.any():
+                    sd[p] = float(np.max(deficit_1d[m]))
+                # else keep ws_default
+        return np.maximum(sd, sd_min)
+
+    redux = np.max if reducer == 'max' else np.mean
     sd = np.full(n_polygons, ws_default, dtype=np.float64)
     for p in range(n_polygons):
         m = (cell_polygon == p) & finite
@@ -554,9 +578,33 @@ class RunoffEngine:
             gets its own sandbox (z, SD_max, A_t).  The divide cell per zone is
             the cell with minimum flow accumulation within that zone.
             Catchment-wide constants (H_a, A_1, A_outlet) remain shared.
+
+        Runoff mechanisms:
+            ``RUNOFF_MECHANISMS`` (config) lists which of {'vsa','horton',
+            'impervious'} are active.  They are orthogonal: VSA (Dunne) builds the
+            saturated-area mask, Horton (Green-Ampt) the infiltration-excess
+            fraction, impervious the urban shed fraction.  When 'vsa' is absent the
+            whole OPM sandbox is skipped and the VSA mask is all-False, so runoff is
+            rain·[Imp + (1−Imp)·infil_excess].  Absent key → legacy behaviour
+            (VSA on; Horton from OPM_INFILTRATION; impervious from IMPERVIOUS_SOURCE).
         """
+        # ── Mechanism selection (orthogonal toggles) ─────────────────────────
+        mechs = getattr(cfg, 'RUNOFF_MECHANISMS', None)
+        if mechs is None:
+            mechs = ['vsa']
+            if getattr(cfg, 'OPM_INFILTRATION', 'none').lower() == 'green_ampt':
+                mechs.append('horton')
+            if getattr(cfg, 'IMPERVIOUS_SOURCE', 'none').lower() != 'none':
+                mechs.append('impervious')
+        mechs = [str(m).lower().strip() for m in mechs]
+        self._vsa_on        = 'vsa' in mechs
+        self._horton_on     = 'horton' in mechs
+        self._impervious_on = 'impervious' in mechs
+        print(f"  RunoffEngine    |  mechanisms: "
+              f"{[m for m in ('vsa', 'horton', 'impervious') if m in mechs] or 'none'}")
+
         Q_max = float(cfg.OPM_Q_MAX)
-        if Q_max <= _OPM_Q_MIN:
+        if self._vsa_on and Q_max <= _OPM_Q_MIN:
             raise ValueError(
                 f"OPM_Q_MAX={Q_max} m³/s must be > {_OPM_Q_MIN} m³/s (Q_min)."
             )
@@ -589,11 +637,14 @@ class RunoffEngine:
         # A_outlet: total catchment area [m²]
         A_outlet = float(faccum_1d[-1]) * cell_area
 
-        # Eq 10 — initial threshold contributing area from single discharge measurement
-        A_t_init = A_outlet / (1.0 - np.log(_OPM_Q_MIN / Q_max))
-
-        # Eq 4 ratio (shared — A_t_init comes from watershed-level Q_max)
-        ratio = A_t_init / (A_t_init - A_1)
+        # Eq 10 — initial threshold contributing area from single discharge measurement.
+        # Only meaningful when VSA is active (needs a valid Q_max); placeholder otherwise.
+        if self._vsa_on:
+            A_t_init = A_outlet / (1.0 - np.log(_OPM_Q_MIN / Q_max))
+            ratio    = A_t_init / (A_t_init - A_1)   # Eq 4 ratio (shared)
+        else:
+            A_t_init = A_outlet
+            ratio    = 1.0
 
         # Store catchment-wide constants
         self._opm_A_1      = A_1
@@ -610,12 +661,18 @@ class RunoffEngine:
         xp = self._xp
 
         # ── Impervious fraction (urban areas shed rain regardless of A_t) ─────
+        # Resolved only when the 'impervious' mechanism is active (skipping it also
+        # avoids the LCZ/LULC download); otherwise zero everywhere.
         import routing_utils as _ru
-        imperv_np = _ru.resolve_impervious_fraction(cfg, grid_data)   # (n_cells,)
+        if self._impervious_on:
+            imperv_np = _ru.resolve_impervious_fraction(cfg, grid_data)   # (n_cells,)
+        else:
+            imperv_np = np.zeros(self._n_cells, dtype=np.float64)
         self._imperv_1d = xp.asarray(imperv_np)
 
         # ── Green-Ampt per-cell infiltration setup ────────────────────────────
-        self._infiltration = getattr(cfg, 'OPM_INFILTRATION', 'none').lower()
+        # Horton mechanism membership is authoritative: 'horton' → Green-Ampt.
+        self._infiltration = 'green_ampt' if self._horton_on else 'none'
         self._GA_F_FLOOR   = 1e-9        # m — floor on F so f_p is finite at F=0
         if self._infiltration == 'green_ampt':
             # Wetting-front suction ψ [m] per cell (scalar or SoilGrids texture).
@@ -669,6 +726,19 @@ class RunoffEngine:
                   f"  dtheta0=[{dtheta0_np.min():.3f}, {dtheta0_np.max():.3f}]")
         else:
             self._ga_psi = self._ga_ksat = self._ga_dtheta0 = self._ga_F = None
+
+        # ── VSA (Dunne) sandbox ───────────────────────────────────────────────
+        # When the 'vsa' mechanism is off there is no saturation-excess: the VSA
+        # mask is permanently empty and the OPM sandbox is never built/updated, so
+        # runoff = rain·[Imp + (1−Imp)·infil_excess].  The per-cell Green-Ampt F
+        # still advances (Horton needs it); only the divide sandbox is skipped.
+        if not self._vsa_on:
+            self._per_polygon = False
+            self._vsa_mask    = xp.zeros(self._n_cells, dtype=bool)
+            self._opm_z = self._opm_SD_max = self._opm_A_t = 0.0
+            print("  OPM           |  VSA disabled — runoff from impervious + "
+                  "infiltration-excess only (no saturation-excess sandbox)")
+            return
 
         # ── Per-polygon vs single-sandbox branching ───────────────────────────
         cell_polygon = grid_data.get('cell_polygon')
@@ -739,7 +809,8 @@ class RunoffEngine:
             if deficit_raster:
                 sd_init_arr = _per_zone_sd_from_raster(
                     deficit_raster, cell_polygon, n_polygons,
-                    s_rows, s_cols, reducer, sd_min, SD_max_initial)
+                    s_rows, s_cols, reducer, sd_min, SD_max_initial,
+                    divide_idx=divide_idx)
                 n_real = int((np.abs(sd_init_arr - SD_max_initial) > 1e-9).sum())
                 print(f"                |  Per-zone SD ({reducer}) over watershed "
                       f"cells: {n_real}/{n_polygons} zones populated, "
@@ -936,12 +1007,14 @@ class RunoffEngine:
 
     def _update_opm_sandbox(self, rain_1d, dt):
         """Advance OPM sandbox state by one timestep (dispatches to mode)."""
-        if self._per_polygon:
-            self._update_opm_sandbox_per_polygon(rain_1d, dt)
-        else:
-            self._update_opm_sandbox_single(rain_1d, dt)
+        if self._vsa_on:
+            if self._per_polygon:
+                self._update_opm_sandbox_per_polygon(rain_1d, dt)
+            else:
+                self._update_opm_sandbox_single(rain_1d, dt)
         # Advance per-cell Green-Ampt cumulative infiltration AFTER the sandbox
         # has used the current-step F (forward Euler — matches get_effective_1d).
+        # Runs even with VSA off, since the Horton mechanism depends on F.
         self._update_ga_F(rain_1d, dt)
 
     def _update_ga_F(self, rain_1d, dt):

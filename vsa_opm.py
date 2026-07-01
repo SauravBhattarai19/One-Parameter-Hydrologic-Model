@@ -179,7 +179,8 @@ def run_opm(cfg):
             from runoff_input import _per_zone_sd_from_raster
             sd_init_arr = _per_zone_sd_from_raster(
                 deficit_raster, cell_polygon, n_polygons,
-                s_rows, s_cols, reducer, sd_min, SD_max_initial)
+                s_rows, s_cols, reducer, sd_min, SD_max_initial,
+                divide_idx=poly_divide_idx)
         else:
             sd_init_arr = np.full(n_polygons, SD_max_initial, dtype=np.float64)
 

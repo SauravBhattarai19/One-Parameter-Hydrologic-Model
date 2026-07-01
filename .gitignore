@@ -38,6 +38,9 @@ ENV/
 env/
 .env
 
+# Credentials
+key.json
+
 # IDEs
 .vscode/
 .idea/
