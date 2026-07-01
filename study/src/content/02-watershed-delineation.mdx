@@ -1,0 +1,133 @@
+---
+title: "Chapter 2 — Watershed Delineation"
+chapter: 2
+---
+
+# Chapter 2 — Watershed Delineation
+
+Every raindrop that falls on land belongs to exactly one drainage basin.
+The invisible line separating basins — the **watershed divide** — can be drawn automatically from any DEM using the flow-direction grid we built in Chapter 1.
+
+---
+
+## 2.1 — What Is a Watershed?
+
+A **watershed** (or catchment) is the set of all cells whose water eventually reaches a given **pour point** — the outlet where flow leaves the area of interest.
+The contributing area $A$ at a pour point $(i,j)$ satisfies:
+
+$$
+A(i,j) = \sum_{\substack{(r,c)\;\text{s.t.}\\\text{downstream path}\;(r,c)\to(i,j)}} \Delta x^2
+$$
+
+Every cell upstream of $(i,j)$ is part of its watershed; every cell that drains elsewhere is not.
+
+**Click any cell** to trace its path downstream ("Trace Down"), or to light up every cell that drains through it ("Show Watershed"). Left-click a cell in the watershed mode to relocate the pour point; check "✏️ Edit Terrain" to modify elevations.
+
+<WatershedConceptWidget />
+
+Notice how clicking the outlet corner (3,3) highlights all 16 cells — the entire grid is one watershed when there is a single outlet. Move the pour point inland to select only the contributing sub-area.
+
+---
+
+## 2.2 — The Upstream Tracing Algorithm
+
+D8 arrows point *downstream*. To find a watershed we must follow them *backwards* — a **Breadth-First Search (BFS) upstream**.
+
+```
+watershed ← {pour_point}
+queue     ← [pour_point]
+
+while queue not empty:
+    (r, c) ← queue.dequeue()
+    for each neighbour (nr, nc) of (r, c):
+        if flow[nr][nc] points INTO (r, c):   # arrow tip lands on (r,c)
+            watershed.add(nr, nc)
+            queue.enqueue(nr, nc)
+```
+
+The key test: does `flow[nr][nc]` point into `(r,c)`? In D8 terms, `nr + Δr = r` and `nc + Δc = c`.
+
+**Click any cell** to place the pour point, then press "▶ Delineate" to watch BFS expand step by step. The queue panel on the right shows pending cells (amber = currently examined); the step log records every neighbour check.
+
+<BFSDelineateWidget />
+
+BFS visits every cell **at most once**, so delineation runs in $O(MN)$ — a full continental DEM with 10⁸ cells takes only seconds.
+
+---
+
+## 2.3 — Divides, Multiple Catchments & Stream Order
+
+Real landscapes contain many basins separated by **divides** — ridgelines where adjacent cells flow in opposite directions.
+
+$$
+\text{Strahler order:}\quad O(A \cup B) =
+\begin{cases}
+\max(O_A, O_B) + 1 & \text{if } O_A = O_B \\
+\max(O_A, O_B)     & \text{otherwise}
+\end{cases}
+$$
+
+**Tab 1** colours the two basins and marks divide cells in orange. **Tab 2** animates two raindrops released on either side of the ridge — they flow to opposite outlets. **Tab 3** shows the **Strahler stream order**: order 1 at headwaters, order increases only when two streams of the same order merge.
+
+<CatchmentMapWidget />
+
+The ridge terrain splits cleanly into two 8-cell basins. Drag the FA threshold slider in Tab 3 to see how the stream network grows as you lower the minimum contributing area.
+
+---
+
+## 2.4 — Explore Full Terrain
+
+Switch between five 8×8 presets — valley, mountain, ridge, slope, basin — and explore how terrain shape controls basin geometry and stream structure.
+
+- **✏️ Edit**: raise / lower any cell; watershed and streams update instantly.
+- **📍 Pour Point**: click any cell to delineate its watershed in one step.
+- **🌊 Stream Network**: view the channel network without a pour point; adjust FA threshold $\tau$.
+
+Toggle **Strahler Colors** to see stream order superimposed on the watershed shading.
+
+<WatershedExploreWidget />
+
+---
+
+## 2.5 — For Grad Students
+
+**Pfafstetter coding (1997)** — hierarchical basin numbering 1–9; odd digits = tributary basins, even digits = mainstem inter-basin segments.
+Up to 9 nesting levels encode every sub-basin globally without overlap:
+
+$$
+\text{Pfafstetter code of sub-basin} = P_{\text{parent}} \cdot 10 + k, \quad k \in \{1,\ldots,9\}
+$$
+
+**Hypsometric curve** — cumulative fraction of area above elevation $h$:
+
+$$
+\text{HI} = \int_0^1 h^*(a)\,da \approx \frac{\bar{z} - z_{\min}}{z_{\max} - z_{\min}}
+$$
+
+HI > 0.6 → young, actively dissected landscape; HI < 0.35 → peneplain (monadnock stage).
+
+**Flat-area routing** — Wang & Liu fill creates artificial flats where D8 is ambiguous.
+Solutions: (1) Priority-Flood + $\varepsilon$-gradient (Barnes 2014); (2) least-cost-distance routing (LDD); (3) D∞ on the original unfilled DEM.
+
+**Algorithmic complexity:**
+
+| Step | Algorithm | Complexity |
+|------|-----------|------------|
+| Delineation | Upstream BFS | $O(MN)$ |
+| Catchment map | BFS per outlet | $O(K \cdot MN)$ |
+| Strahler order | Topo-sort + one pass | $O(MN \log MN)$ |
+| Pfafstetter | Recursive delineation | $O(MN \log MN)$ |
+
+---
+
+## Summary
+
+| Concept | Rule | Key point |
+|---------|------|-----------|
+| Watershed | All cells draining to a pour point | Found by upstream BFS, not downstream tracing |
+| BFS delineation | Check if `flow[nr][nc]` points into `(r,c)` | $O(MN)$; each cell visited once |
+| Divide | Cells whose neighbours belong to different basins | Ridge cells — one raindrop, two fates |
+| Flow accumulation | FA ≥ τ defines the channel network | Larger τ → fewer, longer streams |
+| Strahler order | Confluence of equal orders increments order | Quantifies network branching complexity |
+
+**Chapter 3 →** Rainfall–runoff processes — how precipitation becomes streamflow through Hortonian overland flow, saturation-excess, and infiltration.

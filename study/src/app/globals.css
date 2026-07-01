@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* KaTeX display math centering */
+.katex-display { overflow-x: auto; overflow-y: hidden; }
+
+/* Prose overrides for chapter pages */
+.chapter-body {
+  @apply prose prose-slate lg:prose-lg max-w-none;
+}
+.chapter-body h1 { @apply text-4xl font-extrabold tracking-tight mt-0; }
+.chapter-body h2 { @apply text-2xl font-bold mt-12 mb-4; }
+.chapter-body h3 { @apply text-xl font-semibold mt-8 mb-3; }
+.chapter-body blockquote {
+  @apply bg-sky-50 border-l-4 border-sky-400 text-sky-900 not-italic;
+}
+.chapter-body table { @apply text-sm; }
+.chapter-body th { @apply bg-slate-100; }
+.chapter-body code:not(pre code) {
+  @apply bg-slate-100 text-slate-800 px-1 py-0.5 rounded text-sm;
+}

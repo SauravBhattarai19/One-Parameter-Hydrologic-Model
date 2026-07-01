@@ -1,0 +1,134 @@
+---
+title: "Chapter 1 — Digital Elevation Models & Flow Direction"
+chapter: 1
+---
+
+# Chapter 1 — DEMs & Flow Direction
+
+Water always flows to the lowest neighbor. A **Digital Elevation Model** (DEM) stores one number per grid cell — the land-surface elevation $z_{i,j}$ — and that single rule drives every river routing, flood model, and watershed analysis on Earth.
+
+---
+
+## 1.1 — What Is a DEM? Inspect Slope
+
+Each cell in a DEM holds an elevation in metres. The **slope** from any cell to a neighbour determines which way water will flow:
+
+$$
+S_k = \frac{z_{i,j} - z_{i+\delta r,\,j+\delta c}}{d_k},
+\qquad
+d_k = \begin{cases} \Delta x & \text{cardinal (N/S/E/W)} \\ \sqrt{2}\,\Delta x & \text{diagonal} \end{cases}
+$$
+
+**Click any cell** to compute its slope to all 8 neighbours in real time. Left-click raises elevation, right-click lowers it — watch how slopes update instantly.
+
+<SlopeCalcWidget />
+
+The table shows every direction in **ESRI scan order** (E → SE → S → SW → W → NW → N → NE). The steepest positive slope wins; ties are flagged in amber.
+
+---
+
+## 1.2 — Assigning Flow Direction (D8)
+
+The **D8 algorithm** assigns each cell an ESRI power-of-2 code (1–128) pointing to whichever of the 8 neighbours has the largest positive slope. Cells with *no* positive-slope neighbour are **pits** — they'll be marked ⚠.
+
+$$
+\begin{array}{|c|c|c|}
+\hline 32 & 64 & 128 \\ \hline 16 & \cdot & 1 \\ \hline 8 & 4 & 2 \\ \hline
+\end{array}
+$$
+
+Click **"▶ Animate Assignment"** to watch D8 process each cell from highest elevation downward, then release a raindrop from any cell to trace its path to the outlet.
+
+<FlowDirTeachWidget />
+
+On a pit-free terrain every raindrop reaches the boundary. When pits exist, raindrops get permanently stuck — which is why we must fill them before routing.
+
+---
+
+## 1.3 — The Pit Problem & Wang & Liu Fill
+
+A **pit** is a cell lower than all 8 neighbours. Real DEMs contain thousands of spurious pits from radar noise, road embankments, and data voids. They must be removed before flow routing.
+
+**Wang & Liu (2006)** fix pits with a priority-queue sweep inward from the boundary:
+
+```
+push all border cells to a min-heap (key = z)
+
+while heap not empty:
+    spill, r, c = heap.pop()           # lowest spill level first
+    for each unvisited neighbour (nr, nc):
+        filled = max(z[nr][nc], spill) # raise only if in a depression
+        heap.push(filled, nr, nc)
+```
+
+The critical insight: the **lowest border cell** reaches any interior pit *before* the higher surrounding walls do — so pits fill to the outlet spill level, not the wall height.
+
+<PitTeachWidget />
+
+After filling, every cell has a valid downhill neighbour. Tab 3 shows the D8 arrows on both the original and the filled terrain side-by-side.
+
+---
+
+## 1.4 — Topological Order & Flow Accumulation
+
+To count how many cells drain through each point, we need **flow accumulation** (FA):
+
+$$
+\text{FA}(i,j) = 1 + \sum_{\substack{(r,c)\;\text{s.t.}\\\text{dir}(r,c)\to(i,j)}} \text{FA}(r,c)
+$$
+
+Every cell starts with FA = 1 (itself). Then we must process cells **upstream-first** — if we donate to a downstream cell before all its upstream donors have been counted, the total is wrong.
+
+**Topological order:** on a pit-free DEM, sorting cells by elevation *descending* is a valid topological order, because every upstream cell has higher (or equal) elevation than its downstream neighbour.
+
+<TopoAccumWidget />
+
+The **Tab 1** shows processing order numbered 1 → 16. **Tab 2** animates each cell donating its FA count to its downstream neighbour. Set the stream threshold $\tau$ after the animation to reveal the channel network.
+
+---
+
+## 1.5 — Explore Full Terrain
+
+Now try the full 8×8 editor with all four views — terrain editing, D8 arrows, slope calculator, and raindrop — plus the 3-D canvas. Switch presets (ridge, valley, mountain, basin) to build intuition for how terrain shape controls the stream network.
+
+<DEMFlowWidget />
+
+---
+
+## 1.6 — For Grad Students
+
+**D-infinity (Tarboton 1997)** — triangular facets, continuous direction angle $\alpha$, flow split between two bracketing neighbours:
+
+$$
+f_1 = \frac{\alpha_2 - \alpha}{\alpha_2 - \alpha_1}, \qquad f_2 = 1 - f_1
+$$
+
+**Multiple Flow Direction (Quinn 1991)** — slope-weighted split to *all* downhill neighbours (used in OPM's VSA hydrology model):
+
+$$
+f_k = \frac{S_k^{\,\gamma}}{\displaystyle\sum_{k:\,S_k>0} S_k^{\,\gamma}}, \qquad \gamma=1 \text{ (linear)}\;\longrightarrow\;\infty \text{ (approaches D8)}
+$$
+
+**Algorithmic complexity:**
+
+| Step | Algorithm | Complexity |
+|------|-----------|------------|
+| Flow direction | D8 | $O(MN)$ |
+| Pit fill | Wang & Liu priority queue | $O(MN \log MN)$ |
+| Flow accumulation | Topological sort + one pass | $O(MN)$ |
+
+---
+
+## Summary
+
+| Concept | Formula / Rule | Key point |
+|---------|---------------|-----------|
+| DEM | $z_{i,j}$ per cell | Grid with resolution $\Delta x$ |
+| D8 slope | $S_k = \Delta z / d_k$ | Cardinal $d=1$; diagonal $d=\sqrt{2}$ |
+| Flow direction | $\arg\max_k\,S_k > 0$ | ESRI codes 1–128; pit → code 0 |
+| Tie-breaking | First in scan order | Artefact; D∞ avoids it |
+| Pit fill | Priority queue from edges | Fills to lowest spill path, not wall height |
+| Topological order | Sort by $z$ descending | Guarantees upstream-first processing |
+| Flow accumulation | FA = topo-order sum | Hilltop = 1; channel = large FA |
+
+**Chapter 2 →** Watershed delineation — draw catchment boundaries automatically from any DEM.

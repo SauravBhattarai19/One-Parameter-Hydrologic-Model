@@ -1,0 +1,345 @@
+---
+title: "Chapter 4 — Kinematic-Wave Routing"
+chapter: 4
+---
+
+# Chapter 4 — Kinematic-Wave Routing
+
+A flood wave arrives at the downstream gauge minutes before the water molecules that triggered it. Grasping why — and how to compute it — is the foundation of every 1-D flood routing model, including the OPM engine this course is built around.
+
+---
+
+## 4.1 — The Saint-Venant Equations
+
+The complete physics of 1-D open-channel flow is captured by the **Saint-Venant equations** — one continuity law and one momentum law:
+
+$$
+\frac{\partial A}{\partial t} + \frac{\partial Q}{\partial x} = q_\text{lat}
+\qquad \text{(continuity)}
+$$
+
+$$
+\underbrace{\frac{\partial Q}{\partial t}}_{\small(1)} +
+\underbrace{\frac{\partial (Q^2/A)}{\partial x}}_{\small(2)} +
+\underbrace{gA\frac{\partial h}{\partial x}}_{\small(3)} +
+gA(S_f - S_0) = 0
+\qquad \text{(momentum)}
+$$
+
+The **kinematic wave** drops terms ①②③ — local acceleration, convective acceleration, and pressure gradient — leaving only friction balanced by gravity: $S_f = S_0$.  Combined with Manning's equation this yields the power law $Q = \alpha A^\beta$, which is the only equation OPM's kinematic router needs per cell.
+
+**Click each term** to drop it and watch the simplification cascade. Press "Drop Inertia (①②③)" to jump straight to kinematic.
+
+<SaintVenantWidget />
+
+The table on the right shows that dropping ① and ② gives the **diffusive wave** (keeps backwater); dropping all three gives the **kinematic wave** (bed-slope-only friction). Every term you drop is an assumption — revisit them in §4.7.
+
+---
+
+## 4.2 — Manning's Rating Curve & Wave Celerity
+
+For a **wide rectangular channel** ($B \gg h$, so hydraulic radius $R \approx h$), Manning's equation integrates into the power law:
+
+$$
+Q = \underbrace{\frac{S_0^{1/2}}{n B^{2/3}}}_{\alpha} \cdot A^{\,\beta}, \qquad \beta = \tfrac{5}{3}
+$$
+
+The **wave celerity** $c$ — the speed at which a small disturbance propagates downstream — is the slope of the rating curve:
+
+$$
+c = \frac{dQ}{dA} = \beta \cdot \frac{Q}{A} = \tfrac{5}{3}\, u
+$$
+
+Wave speed is always **5/3 times the flow velocity**. The water moves at $u$; the wave front races ahead at $c = 1.67\, u$.
+
+Adjust the sliders below to explore any channel geometry. The animation at the bottom shows the water particles (blue) lagging behind the wave crest (amber) by exactly that 5/3 ratio. The full step-by-step derivation — plus the physical and geometric intuition for *why* the wave always outruns the water — is built into the widget below the sliders.
+
+<ManningCelerityWidget />
+
+At the default settings (n=0.04, S₀=0.001, B=10 m, h=1.15 m): $\alpha = 0.1703$, $u = 0.87$ m/s, $c = 1.45$ m/s. The Courant column in the table turns red when $C = c\,\Delta t/\Delta x > 1$ — that is the stability boundary for explicit schemes.
+
+---
+
+## 4.3 — Explicit Finite Differences & the Courant Condition
+
+The kinematic wave equation $\partial A/\partial t + \partial Q/\partial x = q_\text{lat}$ is a **partial differential equation** — it links how $A$ changes in space *and* time simultaneously. For a real river, wave speed $c = \tfrac{5}{3}u$ depends on depth, which changes as the flood evolves. No closed-form solution exists. We must solve it **numerically**: replace the continuous derivatives with finite ratios on a discrete grid, then march forward one step at a time.
+
+The widget below builds this from absolute scratch — from "what is a finite difference?" to a 3-reach calculation you can verify with a calculator.
+
+<FiniteDiffBuildupWidget />
+
+---
+
+The explicit update formula (derived in the widget above):
+
+$$
+A_i^{n+1} = A_i^n - \frac{\Delta t}{\Delta x}\bigl(Q_i^n - Q_{i-1}^n\bigr) + \Delta t\, q_\text{lat}
+$$
+
+then evaluate $Q_i^{n+1} = \alpha\,(A_i^{n+1})^\beta$.  The scheme is **first-order accurate** and **conditionally stable**: wave speed $c$ and time step $\Delta t$ must satisfy
+
+$$
+C = \frac{c\,\Delta t}{\Delta x} \leq 1
+$$
+
+Use the **Step Through** tab below to watch 12 time steps unfold across 8 reaches. Drag $\Delta t$ past 346 s to trigger instability. Toggle **"Enable Flux Limiter"** to see OPM's fix.
+
+<ExplicitSchemeWidget />
+
+*Seeing* the blow-up is not the same as understanding it — and instability is only half the story. The next section derives where the $C \leq 1$ limit actually comes from, and the quieter tax the grid charges even when you obey it.
+
+---
+
+## 4.4 — The Computer's White Lie: Numerical Diffusion & the Courant Number
+
+§4.3 showed *that* the explicit scheme blows up past $C=1$. This section shows *why* — and the subtler price you pay even when you stay safely below it. The headline: a pure kinematic wave should translate a flood **without changing its shape**, yet every grid quietly shrinks and smears the peak.
+
+### Where the wave equation comes from
+
+Continuity $\partial A/\partial t + \partial Q/\partial x = 0$ closed with the rating curve $Q=\alpha A^\beta$ (so $\partial Q/\partial x = c\,\partial A/\partial x$ with $c = dQ/dA$) collapses to a single **advection equation**:
+
+$$
+\frac{\partial A}{\partial t} + c\,\frac{\partial A}{\partial x} = 0
+\qquad\Longrightarrow\qquad
+A(x,t) = A_0(x - ct)
+$$
+
+The exact solution is just the *initial shape slid downstream at speed $c$* — sharp stays sharp, the peak is preserved forever. So any flattening your model produces is **not physics; it is numerical**, and the Courant number $C = c\,\Delta t/\Delta x$ controls exactly how much.
+
+<AdvectionSmearWidget />
+
+### The update is a weighted average
+
+Discretize with forward-time, backward-space (upwind — because the water arrives from upstream) and rearrange:
+
+$$
+\frac{Q_i^{n+1}-Q_i^n}{\Delta t} + c\,\frac{Q_i^n - Q_{i-1}^n}{\Delta x}=0
+\quad\Longrightarrow\quad
+\boxed{\,Q_i^{n+1} = C\,Q_{i-1}^n + (1-C)\,Q_i^n\,}
+$$
+
+For $0\le C\le 1$ both weights are positive and sum to one, so the new value is a **weighted average** of *upstream* and *here* — it can never escape the range it started in (bounded $\Rightarrow$ stable). At $C>1$ the weight $(1-C)$ turns **negative**: no longer an average but an extrapolation, and the errors amplify every step.
+
+<CourantBlendWidget />
+
+> **Telephone-game intuition.** Pass a message cell to cell. Copy it *exactly* ($C=1$) and it survives. Blend in a bit of your own value ($C<1$) and it blurs a little each time — that blur *is* the diffusion. *Exaggerate* it ($C>1$) and it explodes into nonsense.
+
+### What the computer is really solving
+
+Taylor-expand that update around $(x_i,t_n)$, keep the leading error, then use the equation itself to trade the time error for a space error ($Q_{tt}=c^2 Q_{xx}$). The scheme turns out **not** to solve pure advection — it solves advection plus a diffusion term nobody wrote down:
+
+$$
+\frac{\partial Q}{\partial t} + c\,\frac{\partial Q}{\partial x} = \alpha\,\frac{\partial^2 Q}{\partial x^2},
+\qquad
+\alpha = \frac{c\,\Delta x}{2}\,(1 - C)
+$$
+
+That $\alpha\,Q_{xx}$ is the **heat / diffusion operator** — it spreads and flattens gradients. Because $c,\Delta x>0$, the sign of this *artificial* diffusion is the sign of $(1-C)$:
+
+| Courant | $\alpha$ | what happens |
+|---|---|---|
+| $C<1$ | $\alpha>0$ | real diffusion → **smears / damps** the peak (stable, but dissipative) |
+| $C=1$ | $\alpha=0$ | pure advection recovered → **exact**, no smear |
+| $C>1$ | $\alpha<0$ | **anti-diffusion** → sharpens & amplifies → **blows up** |
+
+<ModifiedEquationWidget />
+
+**The counterintuitive trap.** Since $\alpha=(c\,\Delta x/2)(1-C)$, on a *fixed grid* shrinking $\Delta t$ pushes $C\to 0$ and drives $\alpha$ **up** toward its maximum $c\,\Delta x/2$. A smaller, "safer" time step makes the smearing **worse**, not better — the only cures are a finer $\Delta x$ or pushing $C\to 1$. This is exactly why OPM targets $C=0.85$ (`CFL_TARGET`) instead of a tiny step, and why `config.py` warns that a static $\Delta t\approx0.9$ s "over-diffuses (damps/smears the peak)."
+
+### Grid speed vs. water speed
+
+The upwind stencil reaches exactly one cell upstream per step, so information cannot travel faster than the **grid celerity** $c_\text{grid}=\Delta x/\Delta t$. The Courant number is the ratio of the two wave speeds — how many cells the flood crosses in one step:
+
+$$
+C = \frac{c\,\Delta t}{\Delta x} = \frac{c}{\,\Delta x/\Delta t\,} = \frac{\text{wave speed}}{\text{grid speed}}
+$$
+
+Trace the characteristic back from the node you are solving: the water there *came from* $x_i - c\,\Delta t = x_i - C\,\Delta x$ upstream. Land on a node ($C=1$) and the answer is exact; land *between* nodes ($C<1$) and the scheme linearly interpolates a curved profile — cutting the corner, shaving the peak, **which is the numerical diffusion you just derived**; land *outside* the stencil ($C>1$) and the formula reaches for data it does not have $\Rightarrow$ instability.
+
+<GridCharacteristicWidget />
+
+### Why $C>1$ erupts into *oscillations*
+
+You watched a peak both collapse *and* spike when $C>1$ — let's see why it flickers like that instead of just growing. The grid carries information **one cell per step** (the stencil reaches one cell upstream). When $C>1$ the wave travels **more than one cell per step**, leaping *past* node $i-1$ into a cell the update cannot see; forced to rebuild that value from the only two nodes it has, the scheme stops interpolating and starts **extrapolating**, overshooting to the wrong side.
+
+To see the runaway in its purest form, feed the update the jaggediest pattern a grid can hold — a **sawtooth**, where every cell is the mirror image of its neighbour, $Q_{i-1}^n = -Q_i^n$. The whole update collapses to a single multiply:
+
+$$
+Q_i^{n+1} = C\,Q_{i-1}^n + (1-C)\,Q_i^n = C(-Q_i^n) + (1-C)\,Q_i^n = (1-2C)\,Q_i^n
+$$
+
+So each step the entire zigzag is just scaled by one number, $g = 1-2C$:
+
+| $C$ | $g = 1-2C$ | each step the zigzag… | meaning |
+|---|---|---|---|
+| $0.5$ | $0$ | vanishes instantly | diffusion crushes the wiggles |
+| $1$ | $-1$ | flips sign, same size | neutral — the exact knife-edge |
+| $1.6$ | $-2.2$ | flips sign **and grows ×2.2** | oscillation **+** blow-up |
+
+A **negative** $g$ means every cell swaps sign each step — high $\to$ low $\to$ high — which *is* the oscillation; $|g|>1$ means each swing is bigger than the last. That is why, once $C>1$, a peak doesn't merely grow: it **flickers up and down while exploding**. Press ▶ below and compare the creeping, smooth spread at small $\Delta t$ with the growing sawtooth past $C=1$.
+
+<WaveCrossingWidget />
+
+---
+
+## 4.5 — Adaptive Δt: Global vs. Local Time Stepping (and How to Keep It Physical)
+
+§4.4 left us on a knife-edge: $C>1$ explodes, $C\ll1$ over-smears, and only $C\approx1$ is both stable and sharp. But the wave speed $c=\tfrac53 u$ is **not** a constant — it changes from cell to cell (steep headwater vs. flat valley) and from moment to moment (rising vs. falling limb). No single fixed $\Delta t$ can hold $C\approx1$ everywhere, for all time. The fix is to let the flow choose the step: **adaptive time stepping**.
+
+### How adaptive Δt works (what OPM does)
+
+Each step, find the fastest wave anywhere on the wet grid and size $\Delta t$ so *its* Courant number lands on the target:
+
+$$
+\Delta t^{n} = C_\text{target}\cdot\frac{\Delta x}{c_\max^{n}},
+\qquad c_\max^{n} = \max_i c_i^{n}
+$$
+
+OPM uses $C_\text{target}=0.85$, with a floor/ceiling and a **growth limiter** (Δt may shrink instantly but grow by at most 1.5× per step, so a sudden drop in $c_\max$ can't dump a volume pulse). In the real source it is one line — a `max` over the whole domain:
+
+```python
+inv_dt     = c_1d / dx            # per-cell 1/Δt requirement
+inv_dt_max = float(inv_dt.max())  # ← the single fastest cell wins
+dt_new     = cfl_target / inv_dt_max
+```
+
+That `max` is the whole story: **one $\Delta t$ for every cell, dictated by the one fastest cell.** This is **global** (synchronous) adaptive stepping.
+
+### Global vs. Local
+
+| | **Global** (what OPM uses) | **Local** (per-cell, "LTS") |
+|---|---|---|
+| Δt rule | one $\Delta t = C_\text{target}\,\Delta x/c_\max$ | each cell its own $\Delta t_i = C_\text{target}\,\Delta x/c_i$ |
+| Courant reached | $C_\text{target}$ only at the fastest cell | $C_\text{target}$ **everywhere** |
+| Slow cells | run at $C\ll C_\text{target}$ → over-diffuse | stay at $C_\text{target}$ → minimal diffusion |
+| Sync / conservation | trivial (all cells same time level) | must match fluxes across Δt interfaces |
+| Cost | wastes tiny steps on slow cells | each cell stepped only as often as needed |
+
+### The hidden tax of going global
+
+Under the one global $\Delta t$, a cell's *actual* Courant number is
+
+$$
+C_i = \frac{c_i\,\Delta t}{\Delta x} = C_\text{target}\cdot\frac{c_i}{c_\max}.
+$$
+
+Only the single fastest cell runs at $C_\text{target}$; a flat valley cell with $c_i\ll c_\max$ runs at $C_i\approx0$. Recall from §4.4 that the smear a peak collects crossing a reach of length $L$ is $\sigma^2 = \Delta x\,L\,(1-C)$ — it depends on $(1-C)$ and geometry, **not** on how fast the wave is. So at the steep cell the factor is $(1-C)=0.15$, while at the flat cell it is $\approx1$:
+
+> The flat reaches over-damp the flood peak **~6× harder** than the cell that set the timestep — purely because the global $\Delta t$ forced them far below their own stability limit. It is the grid attenuating the peak, not the physics.
+
+This is most damning for the **kinematic** wave, whose true attenuation is *zero* — every bit of flat-reach peak loss is a grid artifact. For the **diffusive** wave there is real attenuation ($D_\text{phys}=Q/2BS_0$), but the global $\Delta t$ stacks *uncalibrated* numerical diffusion on top, and since $D_\text{num}$ and $D_\text{phys}$ occupy the **same** $\partial^2/\partial x^2$ slot, the model can no longer tell you which fraction of a flat-valley hydrograph's attenuation is real. (Chapter 5 §5.5 puts OPM's true $\Delta x\approx100$ m numbers on this: the flat cell's $C$ is 164× smaller than the steep cell's, and its $D_\text{num}$ reaches $\approx28\%$ of $D_\text{phys}$.)
+
+<AdaptiveDtWidget />
+
+### Can a GPU do these? (the architecture answer)
+
+This is the real reason OPM went global. A **global** $\Delta t$ has every cell doing the *identical* update at the *identical* time — perfect **SIMT lockstep**, one kernel, coalesced memory, no divergence. It is the GPU's happy path (and fine on CPU).
+
+**Local** stepping is the opposite. Different cells take different numbers of steps at different times, which on a GPU means **warp divergence** (threads in a warp branch apart), **load imbalance** (a fast cell's thread does 10× the work of a slow one in the same launch), irregular synchronization, and conservative **flux matching** across $\Delta t$ interfaces (atomic "reflux"). On a **CPU** none of that hurts — irregular scheduling and event queues are natural, and LTS is a classic CPU speed-up for heterogeneous hydraulics. The GPU-tractable compromise is **block / class LTS**: bin cells into a few power-of-two $\Delta t$ classes, give each class its own kernel, sub-cycle the fast classes, and reconcile fluxes at synchronization points — coarser than per-cell, but it keeps each kernel in lockstep.
+
+### How to keep it physical
+
+Four routes, from cheapest-to-bolt-on to most general:
+
+1. **Local / block time stepping** — hold every cell at $C\approx C_\text{target}$ so the numerical diffusion is uniform and minimal; the flat reaches stop over-damping. Direct cure, GPU-costly (above), needs conservative inter-Δt coupling.
+2. **Higher-order / TVD spatial flux** (Lax–Wendroff, MUSCL + a limiter: minmod / van Leer / superbee) — cancels the leading $O(\Delta x)(1-C)$ diffusion, leaving $O(\Delta x^2)$ error that barely depends on $C$. So even a small-$C$ flat cell stops over-smearing — **while keeping the GPU-friendly global $\Delta t$**. For a GPU code this is usually the best value.
+3. **Muskingum–Cunge — make the numerical diffusion *be* the physics.** Instead of fighting $\alpha$, calibrate it: choose the weighting $X=\tfrac12\!\left(1-\dfrac{Q}{B S_0\,c\,\Delta x}\right)$ so the scheme's numerical diffusivity *equals* the hydraulic diffusivity $D=Q/2BS_0$. Then the "artificial" diffusion is no longer artificial — it is exactly the attenuation a diffusive wave should have. The most physically honest answer.
+4. **Implicit (Preissmann θ)** — unconditionally stable, so $\Delta t$ is chosen for accuracy, not CFL; the fast cell no longer forces a tiny global step. But on OPM's branching DAG the confluences break the cheap bidiagonal solve (Chapter 5 §5.6), it needs a general sparse solver at $10^4$–$10^6$ cells, and OPM's own implicit attempt was removed for divergence.
+
+**Verdict.** Global explicit $\Delta t$ is the right *GPU* call, but it leaves the flat-reach diffusion on the table. The cheapest physics-preserving upgrade that *stays* on the GPU is a higher-order/TVD flux (route 2); the most physically honest is Muskingum–Cunge matched diffusion (route 3); the most general is block/class LTS (route 1) — none of which require the full implicit rewrite of route 4.
+
+---
+
+## 4.6 — Beating the CFL Limit: Implicit Schemes & Flux Limiters
+
+When $\Delta t$ must be large (computational cost, large $\Delta x$), two strategies break the CFL barrier:
+
+**Preissmann θ-implicit scheme** — weight spatial differences at the new time level $n+1$ by $\theta$ and at $n$ by $(1-\theta)$:
+
+$$
+\frac{A_i^{n+1} - A_i^n}{\Delta t} + \bar{c}_i \frac{\theta(A_i^{n+1} - A_{i-1}^{n+1}) + (1-\theta)(A_i^n - A_{i-1}^n)}{\Delta x} = q
+$$
+
+This produces a **lower-bidiagonal linear system** solved by forward substitution (Thomas algorithm). Unconditionally stable for $\theta \geq 0.5$; $\theta = 0.6$ is the Preissmann industry standard (HEC-RAS, ISIS, SWMM).
+
+**OPM flux limiter** — no matrix, no extra storage. Simply cap each cell's outflow:
+
+$$
+Q_\text{out} = \min\!\left(Q_\text{Manning},\; \frac{A\,\Delta x}{\Delta t}\right)
+$$
+
+Both keep the simulation stable at $\Delta t = 500$ s (C ≈ 1.16). Explore the trade-offs — the matrix display in Tab 1 shows actual numerical values; the table in Tab 2 highlights exactly which cells hit the limiter. Tab 1 also walks through *what "implicit" means* and animates the Thomas-algorithm forward sweep row by row, using the same numbers shown in the matrix.
+
+<SchemeCompareWidget />
+
+---
+
+## 4.7 — Kinematic vs. Diffusive Wave
+
+The kinematic wave **translates** a flood pulse without changing its shape — peak discharge is perfectly preserved. Real floods don't behave that way: they flatten as they travel, and they back up behind anything that obstructs them. The **diffusive wave** fixes both by trading the bed slope $S_0$ for the water-surface slope, which lets the wave attenuate and feel backwater. A quick preview, dragging the blend weight $\theta_\text{diff}$ from 0 (pure kinematic) to 1 (OPM's default, full diffusive):
+
+<DiffusiveWaveWidget />
+
+| Limitation | Kinematic | Diffusive | Dynamic |
+|-----------|-----------|-----------|---------|
+| No backwater effects | ✗ blind | partial | ✓ |
+| Hydrograph attenuation | ✗ zero | ✓ some | ✓ full |
+| Flat reaches ($S_0 \to 0$) | ✗ fails | ∼ marginal | ✓ |
+| Computational cost | $O(N)$ | $O(N)$ | $O(N \log N)$ |
+| Valid when | $S_0 > 0.001$ | $S_0 > 10^{-4}$ | always |
+
+**Chapter 5 is entirely about this** — a real example of the kinematic wave giving the *wrong* answer, the diffusive equation derived from scratch, OPM's actual GSSHA-style production code walked through line by line, and what running it all under one global timestep costs on flat terrain.
+
+---
+
+## 4.8 — Explore Channel Routing
+
+Try the four presets — **Mountain Torrent** gives small Courant numbers and sharp wave translation; **Lowland River** pushes Courant toward instability with the large $\Delta t$ needed for long low-slope channels. Click any reach to pin its time series on the right chart and watch peaks arrive with a lag of $\Delta x\,(n\,\text{reaches})/c$.
+
+<KinWaveExploreWidget />
+
+---
+
+## 4.9 — For Grad Students
+
+**Method of Characteristics (MOC)** — the kinematic wave equation $\partial A/\partial t + c\,\partial A/\partial x = q$ is hyperbolic; along the characteristic $dx/dt = c$ the solution reduces to an ODE. The CFL condition is geometric: the numerical grid must contain the characteristic within one cell per step.
+
+**Modified equation & von Neumann (§4.4 in full rigor)** — the upwind scheme's leading truncation error is a diffusion term: it actually solves $Q_t + cQ_x = \alpha Q_{xx}$ with $\alpha = \tfrac{c\,\Delta x}{2}(1-C)$. The Fourier (von Neumann) amplification factor $G = (1-C) + Ce^{-ik\Delta x}$ gives $|G|^2 = 1 - 2C(1-C)(1-\cos k\Delta x)$, so $|G|\le 1\ \forall k \iff 0\le C\le 1$ — the CFL bound, with the high-wavenumber damping being the spectral fingerprint of that same $\alpha$.
+
+**Lax-Wendroff (2nd order)** — adds a correction term $\tfrac{1}{2}c^2(\Delta t/\Delta x)^2 \partial^2 A/\partial x^2$ to the upwind scheme that cancels the $\alpha Q_{xx}$ numerical diffusion to leading order, at the cost of mild dispersive overshoot near discontinuities.
+
+**Muskingum-Cunge** — analytically equivalent to the linear kinematic finite-difference scheme; parameters $K = \Delta x/c$ (travel time) and $X = \tfrac{1}{2}(1 - Q/B S_0 c \Delta x)$ (shape factor) match diffusive-wave attenuation exactly when chosen correctly.
+
+**OPM flux limiter derivation** — $Q_\text{out} \leq A\,\Delta x/\Delta t$ is equivalent to capping the effective Courant number at 1 for each cell independently, introducing $O((1-C)\,\Delta x)$ numerical diffusion; the global mass balance closes to floating-point precision.
+
+**GPU vectorisation** — topological sort converts the 2-D routing problem to a 1-D array operation; CuPy `scatter_add` propagates all cell discharges to downstream neighbours in a single vectorised kernel, achieving $\sim\!250$ steps/s on $10^6$ cells.
+
+**Adaptive $\Delta t$ (§4.5 in full)** — OPM uses *global* adaptive stepping, $\Delta t = C_\text{target}\,\Delta x / c_\text{max}$ ($C_\text{target}=0.85$) with a 1.5× growth limiter — recomputed each step from the fastest wet cell. *Local* (per-cell) stepping would hold $C\approx C_\text{target}$ everywhere and kill the flat-reach over-diffusion, but breaks SIMT lockstep; the GPU-tractable middle ground is block/class LTS (power-of-two $\Delta t$ bins). Physics-preserving alternatives without LTS: a TVD/higher-order flux (removes the $O(\Delta x)(1-C)$ term, keeps global $\Delta t$) or Muskingum–Cunge matched diffusion ($D_\text{num}\!\equiv\!D_\text{phys}$).
+
+**Complexity summary:**
+
+| Algorithm | Complexity | Notes |
+|-----------|------------|-------|
+| KW explicit (CPU) | $O(N \cdot T)$ | one pass per step |
+| Preissmann implicit | $O(N \cdot T)$ | banded solve, larger $\Delta t$ |
+| GPU explicit | $O(T)$ effective | $N$ parallelised |
+| Full SVE solver | $O(N \log N \cdot T)$ | iterative Newton per step |
+
+---
+
+## Summary
+
+| Concept | Formula | Key point |
+|---------|---------|-----------|
+| Kinematic assumption | $S_f = S_0$ | Drop ①②③ from momentum |
+| Power law | $Q = \alpha A^\beta$, $\beta=\tfrac{5}{3}$ | Manning + wide rectangular |
+| Wave celerity | $c = \beta\,Q/A = \tfrac{5}{3}\,u$ | Wave always outruns water |
+| Courant number | $C = c\,\Delta t/\Delta x \leq 1$ | Stability limit for explicit |
+| Upwind update | $Q_i^{n+1} = C\,Q_{i-1}^n + (1-C)\,Q_i^n$ | Weighted average; $(1-C)<0$ at $C>1$ → blow-up |
+| Numerical diffusion | $\alpha = \tfrac{c\,\Delta x}{2}(1-C)$ | $\alpha>0$ smears, $=0$ exact ($C{=}1$), $<0$ explodes |
+| The $\Delta t$ trap | smaller $\Delta t \Rightarrow$ smaller $C \Rightarrow$ larger $\alpha$ | Tiny step over-smears; aim $C\to 1$, not $C\to 0$ |
+| Global adaptive Δt | $\Delta t = C_\text{target}\Delta x/c_\max$ (one for all) | GPU-ideal, but slow cells get $C\ll1$ → over-diffuse |
+| Keeping it physical | local/block LTS · TVD flux · Muskingum–Cunge | uniform $C$, or kill / calibrate $\alpha$ |
+| Flux limiter | $Q_\text{out} = \min(Q_M,\,V/\Delta t)$ | OPM's CFL-free strategy |
+| Preissmann $\theta$ | $\theta \geq 0.5$ → unconditionally stable | Industry standard |
+| Attenuation | Kinematic: 0%; Diffusive: $>0\%$ | Controlled by $\theta_\text{diff}$ |

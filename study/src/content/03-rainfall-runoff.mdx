@@ -1,0 +1,359 @@
+---
+title: "Chapter 3 — Rainfall-Runoff Generation"
+chapter: 3
+---
+
+# Chapter 3 — Rainfall-Runoff Generation
+
+Chapters 1–2 answered *how does water move across the terrain once it is on the surface?* We pretended every drop of rain instantly became surface runoff. That is almost never true.
+
+Stand in a forest during a shower and the ground stays firm — the rain soaks in. Stand on a city street and the same rain sheets straight into the gutter. Stand in a marshy field next to a stream and your boots fill — the soil is already full, so the rain has nowhere to go but to run off. This chapter fills that gap: *how much of the rainfall actually becomes runoff, where, and when?*
+
+This is also the densest part of OPM. Three physical mechanisms run simultaneously, a "sandbox" model evolves soil state every timestep, and almost every parameter is measured from satellites rather than guessed. Take it one section at a time — by the end, every line of the real `runoff_input.py` will be explained, not simplified away.
+
+---
+
+## 3.1 — Rainfall Is Not Runoff: Three Mechanisms, Five Modes
+
+OPM answers the question with three physical mechanisms working together:
+
+1. **Saturation-excess (Dunne) runoff** — where the soil is already full, every drop runs off. Captured by the **Variable Source Area (VSA)** model (§3.3).
+2. **Infiltration-excess (Hortonian) runoff** — where rain falls faster than the soil can absorb it, the excess runs off. Captured by the **Green-Ampt** infiltration model (§3.4).
+3. **Impervious shedding** — roofs and roads cannot absorb water at all, so a fixed fraction of urban cells sheds everything (§3.5).
+
+The `RunoffEngine` class (`runoff_input.py`) actually supports five modes, selected by `config.RUNOFF_SOURCE`, forming a ladder from "trivial" to "fully physical":
+
+| Mode | `RUNOFF_SOURCE` | What it does |
+|---|---|---|
+| None | `'none'` | All rain becomes runoff; stateless (the Chapter 1–2 assumption) |
+| Coefficient | `'coefficient'` | Multiply rain by a static runoff-coefficient raster $C_f\in[0,1]$ |
+| Raster | `'raster'` | Read a pre-computed runoff time series from disk |
+| SCS-CN | `'scs_cn'` | SCS Curve Number method on cumulative rainfall |
+| VSA-OPM | `'vsa_opm'` | Variable Source Area + Green-Ampt + impervious — the full model |
+
+The simpler modes are useful for teaching and quick what-if runs, but they all hide the physics behind a number you must guess (a coefficient, a curve number). `vsa_opm` instead computes runoff from quantities we can actually *measure* — soil moisture, soil texture, land cover — so it needs no per-storm tuning. The rest of this chapter is about `vsa_opm`.
+
+---
+
+## 3.2 — Two Ways to Get Wet: Dunne vs. Horton
+
+Hydrologists recognise two fundamentally different ways that rain turns into surface runoff. They look the same from a helicopter — water flowing overland — but they start for opposite reasons.
+
+**Saturation-excess (Dunne): the soil is full from below.** Imagine a sponge sitting in a shallow tray of water. The bottom of the sponge is already soaked; the water table has risen into it. Pour more water on top and it runs straight off, because there is no empty pore space left. This happens in valley bottoms and near streams, where groundwater collects. The *rate* of rainfall does not matter — a full sponge rejects everything.
+
+**Infiltration-excess (Horton): the rain is too fast for the surface.** Now take a dry sponge and blast it with a fire hose. Most of the water splashes off, not because the sponge is full, but because water cannot soak through the surface as fast as it arrives. This happens on crusted, compacted, or baked soils during intense storms. Here the rainfall *rate* is everything.
+
+<DunneHortonWidget />
+
+The two mechanisms are not rivals — a real catchment has both at once. Valley bottoms shed by saturation (Dunne); steep dry slopes under an intense burst shed by infiltration-excess (Horton); cities shed because they are paved. OPM runs all three simultaneously and adds their contributions (§3.5).
+
+The VSA idea traces back to TOPMODEL (Beven & Kirkby, 1979), which ranks how likely each point is to saturate using the topographic wetness index $\ln(a/\tan\beta)$ — large where the upslope area $a$ is big (lots of water arrives) and the local slope $\tan\beta$ is small (water lingers). OPM's VSA model (next section) simplifies this to a single, time-varying threshold on upslope area alone, which is what makes it a **one-parameter** model: calibrate it from a single discharge measurement and it tells you the whole saturated pattern.
+
+---
+
+## 3.3 — The Variable Source Area: a One-Parameter Watershed
+
+OPM keeps a tiny "mental model" of the groundwater at the catchment divide — a **sandbox** — and uses it to move a single threshold area $A_t(t)$ up and down. Five equations (numbered as in Pradhan & Ogden, 2010, matching the code's own comments) do all the work.
+
+**Equation 10 — the initial threshold area.** The whole model is calibrated from one number: the pre-storm baseflow $Q_{\max}$ [m³/s] measured at the outlet, together with the catchment area $A_\text{outlet}$ [m²]:
+
+$$
+A_t^{(0)} = \frac{A_\text{outlet}}{1 - \ln(Q_{\min}/Q_{\max})}, \qquad Q_{\min} = 0.001\ \text{m}^3/\text{s (a global floor)}
+$$
+
+Any cell whose upslope area exceeds $A_t^{(0)}$ is *already* saturated when the storm begins. A larger $Q_{\max}$ means a wetter catchment right now — a higher water table, a more extensive saturated zone — so $A_t^{(0)}$ shrinks and more cells qualify as saturated from the start.
+
+**Equation 4 — the constant $H_a$.** Computed once, ties the initial soil-moisture state to that initial threshold area, and never changes again:
+
+$$
+H_a = \frac{A_t^{(0)}}{A_t^{(0)} - A_1}\cdot\ln\!\left(\frac{SD_{\min}}{SD_{\max}^{(0)}}\right)
+$$
+
+where $A_1 = \Delta x^2$ is one grid cell's area, $SD_{\max}^{(0)}$ [m] is the initial root-zone soil-moisture deficit (how much water the soil column could still absorb), and $SD_{\min} = 0.001$ m is a floor. Since $SD_{\min}/SD_{\max}^{(0)} < 1$, $H_a$ is always negative.
+
+**Equation 12 — the sandbox water balance.** The sandbox tracks one state variable, $z$ [m] — the height of the water table above an impervious base at the divide — updated by forward Euler exactly like a routing cell:
+
+$$
+q_b^n = K_\text{lat}S_\text{div}z^n\Delta x, \qquad
+\Delta V = (P_\text{div}A_1 - q_b^n)\Delta t, \qquad
+z^{n+1} = \max\!\bigl(0,\ z^n + \tfrac{\Delta V}{A_1\phi}\bigr)
+$$
+
+$$
+SD_{\max}^{n+1} = \max\!\bigl(SD_{\min},\ SD_{\max}^{(0)} - z^{n+1}\bigr)
+$$
+
+$SD_{\max}$ is how much *more* water the root zone can still take before it saturates. Every millimetre the water table climbs is a millimetre less room left.
+
+**Equation 5 — the dynamic threshold area.** Recomputed every step as the soil wets:
+
+$$
+A_t(t) = \frac{H_a A_1}{H_a - \ln(SD_{\min}/SD_{\max}(t))}, \quad \text{clipped to } [A_1, A_\text{outlet}]
+$$
+
+As $SD_{\max}(t)$ falls, $A_t(t)$ *decreases* — a smaller threshold means more cells clear the bar. **The VSA expands as the storm soaks in.**
+
+**Equation 9 — the VSA mask.** Finally, the saturated set is rebuilt every step from the current threshold:
+
+$$
+\text{cell } i \in \text{VSA} \iff \text{upslope\_area}_i > A_t(t)
+$$
+
+Cells in the VSA shed 100% of rainfall as Dunne runoff; cells outside shed nothing unless Green-Ampt or impervious fractions are active.
+
+Step through the algebra below with a verified 10-cell worked example — every number is reproduced exactly from the project's own hand-checked documentation:
+
+<VSAEquationBuilderWidget />
+
+Now watch the same equations play out spatially. On a real DEM, upslope area isn't uniform — it concentrates in valley bottoms and channel confluences, so that's where saturation appears first:
+
+<VSAMapWidget />
+
+---
+
+## 3.4 — Green-Ampt: When the Soil Can't Keep Up
+
+The VSA model handles the saturated valley bottoms. Green-Ampt (`OPM_INFILTRATION = 'green_ampt'`) handles everywhere else: how fast can unsaturated soil drink the rain, and what is the leftover that runs off?
+
+Green & Ampt (1911) idealised infiltration as a sharp **wetting front** descending into the soil like a piston: saturated above, dry below. Two forces pull water down — gravity, and the capillary suction $\psi$ of the dry soil below the front sucking water into its empty pores. The maximum rate the soil can absorb [m/s] is:
+
+$$
+f_p = K_v\left(1 + \frac{\psi\,\Delta\theta_0}{F}\right)
+$$
+
+with $K_v$ the *vertical* saturated conductivity [m/s], $\psi$ the wetting-front suction [m], $\Delta\theta_0 = \phi - \theta_\text{init}$ the initial moisture deficit [-], and $F$ the cumulative infiltration so far [m]. When the soil is dry ($F\to0$) capacity is huge — all rain soaks in; as it wets ($F\to\infty$) capacity sinks toward $K_v$.
+
+Runoff begins the instant the soil can no longer keep up, $f_p = P$. Solving for the cumulative infiltration at that moment:
+
+$$
+F_c = \frac{K_v\,\psi\,\Delta\theta_0}{P - K_v} \qquad\text{(only defined when } P > K_v\text{)}
+$$
+
+If $P \le K_v$, the soil always wins and there is never any Horton runoff. A worked example: $K_v=5$ mm/hr, $\psi=0.20$ m, $\Delta\theta_0=0.25$, $P=20$ mm/hr gives $F_c = 16.7$ mm, reached after about 50 minutes of steady rain — after which the runoff is $P-K_v=15$ mm/hr, **75% of the rain**.
+
+<GreenAmptWidget />
+
+**The two conductivities you must not confuse.** OPM uses *two* saturated conductivities for two different jobs: $K_v$ (`OPM_GA_KSAT_MMHR`, or gridded via `'gee'`) is the **vertical** rate at which water enters the soil surface — typical 1–50 mm/hr. $K_\text{lat}$ (`OPM_K_SAT`, 44 m/day ≈ 1830 mm/hr) is the **lateral** transmissivity that drains the sandbox sideways down the hillslope — roughly a *thousand* times larger. Using the lateral value for Green-Ampt would make $f_p \gg P$ everywhere, so the soil would never be overwhelmed and Horton runoff would never appear — physically wrong. The names look similar; the roles are opposite.
+
+With `OPM_GA_SUCTION_SOURCE = 'texture'`, the suction $\psi$ is read per cell from soil texture (sand/clay%, from SoilGrids) through the USDA texture triangle and the Rawls (1983) table:
+
+| USDA texture | $\psi$ [m] | typical $K_v$ [mm/hr] |
+|---|---|---|
+| Sand | 0.0495 | 117 |
+| Sandy loam | 0.110 | 23 |
+| Loam | 0.089 | 13 |
+| Silt loam | 0.167 | 7 |
+| Clay loam | 0.209 | 2 |
+| Clay | 0.316 | 0.5 |
+
+Because $\psi$ enters Green-Ampt only as the product $\psi\,\Delta\theta_0$, making it spatial is cheap and consistent with the spatial deficit.
+
+---
+
+## 3.5 — Impervious Surfaces & the Combined Formula
+
+Roofs, roads, and car parks cannot infiltrate at all. Each cell carries an **impervious fraction** $\text{Imp}\in[0,1]$; that fraction of the cell sheds 100% of its rain no matter what the soil or VSA is doing. The source is set by `IMPERVIOUS_SOURCE`: `'lcz'` (Local Climate Zones — designed precisely to describe urban form), `'lulc'` (ESA WorldCover), `'raster'` (a continuous GeoTIFF), or `'none'` ($\text{Imp}=0$).
+
+All three mechanisms collapse into one per-cell effective-runoff rate [m/s]:
+
+$$
+\boxed{\;r_\text{eff} = P\,\bigl[\text{Imp} + (1-\text{Imp})\cdot\text{pervious\_frac}\bigr]\;}
+$$
+
+where the pervious part runs off fully if the cell is saturated, and otherwise only the infiltration-excess fraction runs off:
+
+$$
+\text{pervious\_frac} = \begin{cases} 1.0 & \text{cell} \in \text{VSA (Dunne)} \\ \text{excess\_frac} = \dfrac{\max(P-f_p,\,0)}{P} & \text{otherwise (Horton)} \end{cases}
+$$
+
+| Cell state | Imp | In VSA? | excess | $r_\text{eff}/P$ |
+|---|---|---|---|---|
+| Rural, saturated | 0 | Yes | – | 1.0 (full Dunne) |
+| Urban, saturated | 0.3 | Yes | – | $0.3+0.7\times1=1.0$ (still full) |
+| Rural, dry, soil wins | 0 | No | 0 | 0 (all infiltrates) |
+| Urban, dry, soil wins | 0.3 | No | 0 | 0.3 (only the paving sheds) |
+| Rural, dry, Horton | 0 | No | 0.4 | 0.4 (infiltration-excess) |
+| Urban, dry, Horton | 0.3 | No | 0.4 | $0.3+0.7\times0.4=0.58$ |
+
+**Inside the VSA, impervious fraction is irrelevant.** When pervious_frac = 1, the formula gives $r_\text{eff}=P[\text{Imp}+(1-\text{Imp})]=P$ regardless of Imp — a saturated cell already sheds everything, so paving it changes nothing. Impervious fraction only matters *outside* the VSA.
+
+<RunoffDecompositionWidget />
+
+The code also splits $r_\text{eff}$ into three named streams so the mass-balance report can attribute every cubic metre of runoff to a mechanism:
+
+$$
+r_\text{imperv} = P\cdot\text{Imp}, \qquad
+r_\text{Dunne} = P(1-\text{Imp})\cdot\mathbb{1}[\text{in VSA}], \qquad
+r_\text{Horton} = P(1-\text{Imp})\cdot\text{excess\_frac}\cdot\mathbb{1}[\text{off VSA}]
+$$
+
+and by construction $r_\text{imperv}+r_\text{Dunne}+r_\text{Horton}=r_\text{eff}$. This is the real, unabridged function from `runoff_input.py`:
+
+```python
+def _opm_effective_runoff(self, rain_1d):
+    xp = self._xp
+    if self._infiltration == 'green_ampt':
+        f_p = self._ga_ksat * (1.0 + self._ga_psi * self._ga_dtheta0
+                               / xp.maximum(self._ga_F, self._GA_F_FLOOR))
+        excess      = xp.maximum(rain_1d - f_p, 0.0)
+        excess_frac = xp.where(rain_1d > 0.0,
+                               excess / xp.maximum(rain_1d, 1e-30), 0.0)
+    else:
+        excess_frac = 0.0                          # 'none': all rain infiltrates
+
+    pervious_frac = xp.where(self._vsa_mask, 1.0, excess_frac)
+
+    imp  = self._imperv_1d
+    perv = 1.0 - imp
+    self._last_imperv_rate = rain_1d * imp
+    self._last_dunne_rate  = rain_1d * perv * xp.where(self._vsa_mask, 1.0, 0.0)
+    self._last_horton_rate = rain_1d * perv * xp.where(self._vsa_mask, 0.0, excess_frac)
+
+    return rain_1d * (imp + perv * pervious_frac)
+```
+
+The three `_last_*_rate` arrays are exactly the $r_\text{imperv}$, $r_\text{Dunne}$, $r_\text{Horton}$ above, stashed so the router can integrate them into `mb_dunne`, `mb_horton`, `mb_imperv` for the mass-balance CSV — every cubic metre of runoff is attributed to a mechanism, every run.
+
+---
+
+## 3.6 — State Sequencing: the Forward-Euler Call Order
+
+The runoff engine carries state ($z$, $SD_{\max}$, $F$, the VSA mask) that must advance in lock-step with the router. The rule, identical in spirit to the explicit routing of earlier chapters: **use the current state to produce this step's runoff, then advance the state for the next step.**
+
+<CallOrderDiagram />
+
+This is the real call order from `kinematic_wave_router.py`'s time loop:
+
+```python
+if runoff_engine is not None:
+    source_1d = runoff_engine.get_effective_1d(t_seconds, rain_1d)  # [m/s]
+    if _partition:
+        mb_dunne  += runoff_engine._last_dunne_rate.sum()  * (cell_area * dt)
+        mb_horton += runoff_engine._last_horton_rate.sum() * (cell_area * dt)
+        mb_imperv += runoff_engine._last_imperv_rate.sum() * (cell_area * dt)
+    runoff_engine.update_state(rain_1d, dt)
+else:
+    source_1d = rain_1d
+
+rain_vol = source_1d * cell_area * dt
+```
+
+`get_effective_1d` reads the VSA mask, $F$, and $z$ at step $n$; `update_state` then writes $z^{n+1}$, $SD_{\max}^{n+1}$, $F^{n+1}$, and rebuilds the mask for step $n{+}1$. Reversing the two would use *tomorrow's* soil to shed *today's* rain — a cell that saturates partway through this step's storm would incorrectly be treated as already-saturated for this entire step.
+
+---
+
+## 3.7 — Spatial Heterogeneity: One Sandbox Per Rain Gauge
+
+A single sandbox assumes the *whole* basin wets up together. For a large catchment with many rain gauges that is unrealistic — one tributary may be in a downpour while another is dry. With `OPM_PER_POLYGON = True` (the default), each Thiessen rainfall zone gets its *own* sandbox: its own divide cell, its own $z$, $SD_{\max}$, and $A_t$, driven by its own local rainfall.
+
+Each zone's divide is the cell with the *minimum* flow accumulation in that zone (the most headwater point), with ties broken by highest elevation. When the SERVES deficit raster is available, each zone's $SD_{\max}$ is reduced (mean or max, per `OPM_SD_REDUCER`) over *only that zone's* watershed cells, so the soil-moisture partition matches the rainfall partition.
+
+<PerPolygonVSAWidget />
+
+The whole per-polygon sandbox advances with no Python loop over zones — fully vectorised:
+
+```python
+def _update_opm_sandbox_per_polygon(self, rain_1d, dt):
+    xp    = self._xp
+    f_div = self._divide_infiltration(rain_1d)             # (n_polygons,)
+
+    q_b = (self._ksat_ms * self._polygon_slope_divide
+           * self._opm_z * self._cell_size)
+    dV  = (f_div * self._cell_area - q_b) * dt
+    dz  = dV / (self._cell_area * self._phi)
+    self._opm_z = xp.maximum(0.0, self._opm_z + dz)
+
+    self._opm_SD_max = xp.maximum(self._sd_min,
+                                  self._SD_max_initial - self._opm_z)
+
+    Rf_t  = self._sd_min / self._opm_SD_max
+    denom = self._opm_H_a - xp.log(Rf_t)
+    # Guard the near-zero denominator before dividing (xp.where evaluates
+    # both branches, so the divisor must be finite even where unused).
+    denom_safe = xp.where(xp.abs(denom) < 1e-12, 1.0, denom)
+    new_A_t    = xp.where(xp.abs(denom) < 1e-12, self._opm_A_t_init,
+                          self._opm_H_a * self._opm_A_1 / denom_safe)
+    self._opm_A_t = xp.clip(new_A_t, self._opm_A_1, self._opm_A_outlet)
+
+    # Vectorised VSA mask rebuild: each cell uses its polygon's A_t
+    A_t_per_cell   = self._opm_A_t[self._cell_polygon]
+    self._vsa_mask = self._upslope_area > A_t_per_cell
+```
+
+The `denom_safe` guard is the same GPU-safe-indexing family as the `ds_safe` trick from Chapter 5's routing code: **compute everywhere, mask the result.** `xp.where` evaluates both branches before selecting, so the divisor passed into the unused branch must still be finite — even though it's discarded — or the GPU kernel would produce a NaN that `xp.where` can't un-produce after the fact.
+
+---
+
+## 3.8 — From Satellites to Parameters: the SERVES/GEE Chain
+
+So far we have written parameters like $SD_{\max}^{(0)}$, $\phi$, $K_v$, $\psi$, $\text{Imp}$, $n$ as if someone simply typed them in. For the full configuration, almost all of them are instead **measured from satellites** through Google Earth Engine (GEE) — the single biggest reason the model needs essentially no manual calibration.
+
+Why measure instead of guess? The traditional way to set these numbers is to calibrate: run the model, compare to a gauge, nudge the parameters, repeat. That needs a long observed record and produces numbers that may not transfer to the next storm or the next basin. OPM instead reads the *actual* antecedent wetness, soil type, and land cover for the specific date and place — the same way you'd check a weather map before a hike. Same model, new event ⟹ just change the date.
+
+The heart of it is **SERVES**, which estimates how wet the soil was *before* the storm from how green the vegetation is — greener plants imply more available soil water:
+
+$$
+\text{ET fraction} = \text{clamp}(1.33\,\text{NDVI}-0.049,\ 0,\ 1), \qquad
+\theta_\text{SERVES} = \text{ET fraction}\times(FC-WP)+WP
+$$
+
+$$
+\boxed{\;SD_\text{deficit} = (\text{porosity}-\theta_\text{SERVES})\times Z_r\;}
+$$
+
+Greener vegetation ⟹ higher NDVI ⟹ wetter soil (θ near field capacity) ⟹ smaller deficit ⟹ a wetter antecedent state ⟹ a larger initial VSA (§3.3's Eq. 4–5) ⟹ more runoff from the first drops. Every link is physical, and every input is observed.
+
+<SatelliteChainWidget />
+
+| GEE dataset | Provides | Used for |
+|---|---|---|
+| ESA WorldCover v200 (10m) | Land cover class | Root-zone depth $Z_r$, Manning $n$, impervious |
+| WUDAPT LCZ | Local Climate Zone | Manning $n$, impervious, $Z_r$ (urban detail) |
+| Landsat 8/9 (Sentinel-2, MODIS) | NDVI (greenness) | SERVES soil moisture $\theta$ |
+| SoilGrids250m wv0033 / wv1500 | Field capacity, wilting point | $\theta$ range; texture → suction $\psi$ |
+| HiHydroSoil v2.0 wcsat | Saturated water content | Porosity (for $SD_{\max}$, $\phi$) |
+| HiHydroSoil v2.0 Ksat | Vertical conductivity | Green-Ampt $K_v$ |
+| NASA GPM IMERG V07 | Rainfall (0.1°, 30 min) | Precipitation forcing |
+
+**Graceful fallback.** Every `'gee'` source has a scalar fallback. If a cell has no texture data, $\psi$ reverts to `OPM_GA_SUCTION_M`; if Ksat is missing, to `OPM_GA_KSAT_MMHR`; if the whole SERVES query fails, the model uses `OPM_SD_MAX_INITIAL` and `OPM_PHI`. The satellite data *improves* the run; it is never a single point of failure.
+
+---
+
+## 3.9 — Chapter Summary
+
+| Concept | Formula | Key point |
+|---|---|---|
+| Initial threshold (Eq 10) | $A_t^{(0)} = \dfrac{A_\text{outlet}}{1-\ln(Q_{\min}/Q_{\max})}$ | One baseflow reading sets the starting VSA |
+| Constant (Eq 4) | $H_a = \dfrac{A_t^{(0)}}{A_t^{(0)}-A_1}\ln\dfrac{SD_{\min}}{SD_{\max}^{(0)}}$ | Computed once, ties soil state to $A_t^{(0)}$ |
+| Sandbox (Eq 12) | $\Delta z = \dfrac{(P_\text{div}A_1-K_\text{lat}Sz\Delta x)\Delta t}{\phi A_1}$ | Forward-Euler water table at the divide |
+| Dynamic threshold (Eq 5) | $A_t(t) = \dfrac{H_aA_1}{H_a-\ln(SD_{\min}/SD_{\max}(t))}$ | Falls as the storm wets the soil |
+| VSA mask (Eq 9) | in VSA $\iff$ upslope\_area $>A_t(t)$ | Saturated set, rebuilt every step |
+| Green-Ampt | $f_p=K_v(1+\psi\Delta\theta_0/F)$ | Horton runoff once $f_p$ drops to $P$ |
+| SERVES deficit | $SD_{\max}=(\text{porosity}-\theta_\text{SERVES})Z_r$ | Satellite greenness → soil parameter |
+| Combined | $r_\text{eff}=P[\text{Imp}+(1-\text{Imp})\,\text{pervious\_frac}]$ | All three mechanisms in one number |
+
+**Key takeaways:**
+
+1. Rainfall is not runoff. OPM converts it with three mechanisms running at once: saturation-excess (VSA/Dunne), infiltration-excess (Green-Ampt/Horton), and impervious urban shedding.
+2. The VSA model is a **one-parameter** scheme: a single baseflow $Q_{\max}$ sets the initial saturated area, and a tiny sandbox at the divide moves the threshold $A_t$ down as the storm wets the soil.
+3. Green-Ampt adds Horton runoff for unsaturated cells; it begins once the rain outpaces the soil. Always use the *vertical* $K_v$, never the lateral $K_\text{lat}$ — they differ by roughly 1000×.
+4. The combined formula sums the mechanisms; inside the VSA a cell always sheds 100% of rain, so impervious fraction only matters outside it.
+5. **Per-polygon mode** gives every gauge zone its own sandbox, so spatially variable rain drives spatially variable saturation.
+6. Almost every parameter is **measured, not guessed**: SERVES turns satellite greenness into $SD_{\max}$; SoilGrids and HiHydroSoil give porosity, $\phi$, texture-based $\psi$, and $K_v$; land cover gives roughness, root depth, and imperviousness — every `'gee'` source has a scalar fallback.
+
+The most relevant `config.py` knobs for this chapter:
+
+| Knob | Default | Why |
+|---|---|---|
+| `RUNOFF_SOURCE` | `'vsa_opm'` | The full three-mechanism model |
+| `OPM_SD_MAX_INITIAL` | 0.1 m | Root-zone deficit fallback; overridden by SERVES |
+| `OPM_Q_MAX` | 100 m³/s | Observed pre-storm baseflow — the one calibration number |
+| `OPM_PHI` | 0.35 | Drainable porosity fallback; overridden by SoilGrids |
+| `OPM_K_SAT` | 44 m/day | *Lateral* sandbox drainage conductivity |
+| `OPM_PER_POLYGON` | True | One sandbox per gauge zone |
+| `OPM_INFILTRATION` | `'green_ampt'` | Adds the Horton mechanism on top of VSA |
+| `OPM_GA_SUCTION_SOURCE` | `'texture'` | Per-cell $\psi$ from SoilGrids texture |
+| `OPM_GA_KSAT_SOURCE` | `'gee'` | Per-cell vertical $K_v$ from HiHydroSoil v2.0 |
+| `IMPERVIOUS_SOURCE` | `'lcz'` | Urban impervious fraction from Local Climate Zones |
+
+Notice the single human input is `OPM_Q_MAX` — one baseflow reading calibrates the initial VSA; everything else is satellite-derived or a physical constant. With the soil's behaviour now fully specified, the next two chapters route the resulting runoff downstream: Chapter 4 builds the kinematic wave from scratch, and Chapter 5 covers where it fails and how the diffusive wave fixes it.
