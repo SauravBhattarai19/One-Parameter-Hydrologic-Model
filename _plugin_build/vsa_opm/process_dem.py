@@ -31,9 +31,15 @@ except AttributeError as e:
     print(f"Error in config.py: {e}. Please ensure all required variables are defined.")
     exit()
 
-# Create the (scenario) output directory if it doesn't exist.  Driven by
-# config.OUTPUT_DIR so a new scenario folder is created automatically.
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Directory creation is deferred to main() so that callers (e.g. the QGIS
+# plugin) can override OUTPUT_DIR *before* it is created.  Creating it here at
+# import time would use the config.py default and fails when the process CWD is
+# read-only — e.g. QGIS launched from C:\Program Files\... would raise
+# "PermissionError: [WinError 5] Access is denied: 'outputs collection'".
+try:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+except OSError:
+    pass  # deferred to main(), which uses the (possibly overridden) OUTPUT_DIR
 
 def reproject_dem(input_dem_path, output_dem_path, target_crs_epsg):
     """
@@ -252,6 +258,8 @@ def clip_flow_accumulation_by_watershed(flow_accumulation, watershed_raster, out
     return output_path
 
 def main():
+    # Create the (possibly overridden) output directory now — not at import time.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not os.path.exists(DEM_PATH):
         print(f"Error: DEM file not found at {DEM_PATH}. Please provide a valid path in config.py.")
         exit()
