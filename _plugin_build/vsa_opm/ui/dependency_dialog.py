@@ -154,7 +154,27 @@ class DependencyDialog(QDialog):
     def _on_done(self, ok, rc):
         self._set_running(False)
         if ok:
-            self._append("\n✅  Done. Re-checking …")
+            # Make the just-installed packages usable in THIS QGIS session
+            # (no restart) by adding their site dirs to sys.path.
+            added = deps.refresh_import_paths()
+            if added:
+                self._append("\n[INFO] Refreshed import paths:")
+                for d in added:
+                    self._append(f"    + {d}")
+            self.refresh()
+            still = deps.missing(include_optional=False)
+            if still:
+                self._append(
+                    "\n✅  Install finished, but some packages still aren't "
+                    "importable in this running session.\n"
+                    "Please RESTART QGIS, then re-open this dialog and click "
+                    "Re-check — they should turn green."
+                )
+            else:
+                self._append(
+                    "\n✅  Done — all required packages are now available. "
+                    "You can close this dialog and press Run (no restart needed)."
+                )
         else:
             self._append(
                 f"\n❌  pip exited with code {rc}.\n"
@@ -162,7 +182,7 @@ class DependencyDialog(QDialog):
                 "above in the OSGeo4W Shell (Start → OSGeo4W → OSGeo4W Shell), "
                 "then restart QGIS."
             )
-        self.refresh()
+            self.refresh()
 
     def _set_running(self, running):
         for b in (self.install_btn, self.install_all_btn, self.refresh_btn, self.close_btn):
