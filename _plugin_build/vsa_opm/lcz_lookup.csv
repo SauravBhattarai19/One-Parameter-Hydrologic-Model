@@ -1,0 +1,18 @@
+class_code,class_name,root_zone_depth_m,mannings_n,impervious_fraction
+1,Compact high-rise,0.10,0.013,0.95
+2,Compact mid-rise,0.10,0.013,0.90
+3,Compact low-rise,0.20,0.016,0.85
+4,Open high-rise,0.30,0.020,0.65
+5,Open mid-rise,0.30,0.020,0.60
+6,Open low-rise,0.60,0.030,0.50
+7,Lightweight low-rise,0.10,0.018,0.75
+8,Large low-rise,0.20,0.013,0.90
+9,Sparsely built,0.80,0.040,0.20
+10,Heavy industry,0.20,0.016,0.65
+11,Dense trees (A),2.00,0.150,0.00
+12,Scattered trees (B),1.50,0.120,0.00
+13,Bush / scrub (C),1.00,0.100,0.00
+14,Low plants (D),0.80,0.040,0.00
+15,Bare rock / paved (E),0.30,0.015,0.90
+16,Bare soil (F),0.30,0.030,0.00
+17,Water (G),0.10,0.030,0.00
