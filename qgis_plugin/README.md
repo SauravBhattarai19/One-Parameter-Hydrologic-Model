@@ -80,17 +80,36 @@ texture suction, LULC/LCZ Manning's & impervious) need Earth Engine access.
 
 ## Dependencies
 
-All dependencies must be importable from **QGIS's bundled Python interpreter**.
+All dependencies must be importable from **QGIS's bundled Python** (NOT your
+system Python — a normal `pip install` in a terminal targets the wrong
+interpreter and QGIS will still fail with `ModuleNotFoundError`).
 
-| Package | Purpose | Install |
+### Easiest: the built-in Dependencies manager
+
+Open the plugin dialog and click **🔧 Dependencies**. It shows which packages
+are present in QGIS's Python and installs the missing ones into that same
+interpreter with one click (with a live log and a copyable manual command if an
+install needs elevated permissions). The dialog also pops up automatically if
+you press **Run** while something required is missing.
+
+| Package | Purpose | Required? |
 |---|---|---|
-| `numpy`, `pandas` | Array math / CSV I/O | Usually pre-installed |
-| `rasterio` | Raster I/O | `pip install rasterio` |
-| `pysheds` | Hydrological analysis | `pip install pysheds` |
-| `scipy` | Spatial weights (KDTree) | `pip install scipy` |
-| `matplotlib` | Embedded hydrograph plot | `pip install matplotlib` |
-| `earthengine-api` *(optional)* | GEE / IMERG / SERVES | `pip install earthengine-api` |
-| `cupy` *(optional)* | GPU acceleration | `pip install cupy-cuda12x` |
+| `numpy`, `pandas` | Array math / CSV I/O | required (usually pre-installed) |
+| `scipy` | Spatial weights (KDTree) | required |
+| `rasterio` | Raster read/write | required |
+| `pysheds` | DEM watershed delineation | required |
+| `matplotlib` | Embedded hydrograph plot | optional |
+| `earthengine-api` | GEE / IMERG / SERVES | optional (satellite features) |
+| `cupy` | GPU acceleration | optional (`pip install cupy-cuda12x`) |
+
+### Manual fallback (Windows)
+
+If a one-click install hits a permission error, open **Start → OSGeo4W →
+OSGeo4W Shell** and run the command the Dependencies dialog shows, e.g.:
+```
+python -m pip install rasterio pysheds scipy pandas
+```
+then restart QGIS. On Linux/macOS run the same command against the QGIS Python.
 
 **Check inside the QGIS Python console:**
 ```python

@@ -169,6 +169,8 @@ class TabPrecip(QWidget):
 
     def _on_method_changed(self, idx):
         self._stack.setCurrentIndex(idx)
+        # "Exclude outside stations" only applies to gauge/pixel methods.
+        self.exclude_outside.setVisible(self._METHODS[idx] != "uniform")
 
     # ── Public getters ────────────────────────────────────────────────────────
 

@@ -32,6 +32,8 @@ from qgis.PyQt.QtCore import Qt
 
 from ..bridge.config_bridge import OpmConfig
 from ..bridge.runner import OpmWorker
+from ..bridge.dependencies import missing as missing_deps
+from .dependency_dialog import DependencyDialog
 from .tab_dem import TabDem
 from .tab_precip import TabPrecip
 from .tab_runoff import TabRunoff
@@ -160,12 +162,19 @@ class OpmMainDialog(QDialog):
             "compatible with config.py format."
         )
 
+        self.deps_btn = QPushButton("🔧  Dependencies")
+        self.deps_btn.setToolTip(
+            "Check / install the Python packages the model needs\n"
+            "(rasterio, pysheds, …) into QGIS's own Python."
+        )
+
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.close)
 
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.cancel_btn)
         btn_row.addWidget(self.save_cfg_btn)
+        btn_row.addWidget(self.deps_btn)
         btn_row.addStretch()
         btn_row.addWidget(self.close_btn)
 
@@ -177,11 +186,29 @@ class OpmMainDialog(QDialog):
         self.run_btn.clicked.connect(self._on_run)
         self.cancel_btn.clicked.connect(self._on_cancel)
         self.save_cfg_btn.clicked.connect(self._on_save_config)
+        self.deps_btn.clicked.connect(self._open_dependencies)
 
     # ── Run / Cancel ──────────────────────────────────────────────────────────
 
     def _on_run(self):
         """Validate config, build stages list, spawn worker thread."""
+        # ── Dependency guard ──────────────────────────────────────────────────
+        # Catch missing packages up-front so users get a guided installer instead
+        # of a cryptic "ModuleNotFoundError: No module named 'rasterio'".
+        miss = missing_deps(include_optional=False)
+        if miss:
+            names = ", ".join(m[1] for m in miss)
+            resp = QMessageBox.question(
+                self, "Missing Python packages",
+                f"The model needs these packages, which are not installed in "
+                f"QGIS's Python:\n\n    {names}\n\n"
+                "Open the Dependencies manager to install them now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if resp == QMessageBox.Yes:
+                self._open_dependencies()
+            return
+
         cfg = self._collect_config()
         if cfg is None:
             return   # validation failed; user already shown a message
@@ -272,6 +299,11 @@ class OpmMainDialog(QDialog):
             return None
 
         return cfg
+
+    def _open_dependencies(self):
+        """Open the dependency status/installer dialog (modal)."""
+        dlg = DependencyDialog(parent=self)
+        dlg.exec_()
 
     def _on_save_config(self):
         """Export current settings to a config.py-compatible Python file."""

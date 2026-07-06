@@ -1,0 +1,180 @@
+# -*- coding: utf-8 -*-
+"""
+dependencies.py
+===============
+Detect and install the third-party Python packages the VSA-OPM model needs,
+targeting the interpreter QGIS is actually running on (NOT the system Python).
+
+Why this exists
+---------------
+QGIS ships its own bundled Python (OSGeo4W on Windows, a framework build on
+macOS).  Running ``pip install rasterio`` in a normal terminal installs into
+the *system* Python, so QGIS still can't import it.  This module locates the
+QGIS interpreter and drives ``pip`` against it, so the user never has to find
+the OSGeo4W Shell.
+
+Public API
+----------
+    REQUIRED, OPTIONAL          – [(import_name, pip_name, purpose), …]
+    is_available(import_name)   – bool
+    missing(include_optional)   – list of (import_name, pip_name, purpose)
+    python_executable()         – path to the QGIS Python interpreter
+    manual_command(pip_names)   – the exact command to paste into a shell
+    install(pip_names, log, …)  – run pip; returns (ok: bool, returncode: int)
+"""
+
+import importlib
+import os
+import subprocess
+import sys
+
+
+# (import name, pip name, human purpose) ---------------------------------------
+REQUIRED = [
+    ("numpy",    "numpy",    "array math"),
+    ("pandas",   "pandas",   "CSV / hydrograph I/O"),
+    ("scipy",    "scipy",    "spatial weights (KDTree)"),
+    ("rasterio", "rasterio", "raster read/write"),
+    ("pysheds",  "pysheds",  "DEM watershed delineation"),
+]
+
+OPTIONAL = [
+    ("matplotlib", "matplotlib",      "embedded hydrograph plot"),
+    ("ee",         "earthengine-api", "IMERG / SERVES / LULC / LCZ (Earth Engine)"),
+]
+
+
+def is_available(import_name: str) -> bool:
+    """True if ``import <import_name>`` succeeds in this interpreter."""
+    try:
+        importlib.import_module(import_name)
+        return True
+    except Exception:  # noqa: BLE001 — any import failure means "not usable"
+        return False
+
+
+def missing(include_optional: bool = False):
+    """Return the subset of REQUIRED (+ OPTIONAL) that cannot be imported."""
+    items = list(REQUIRED)
+    if include_optional:
+        items += OPTIONAL
+    return [(mod, pip, why) for (mod, pip, why) in items if not is_available(mod)]
+
+
+def python_executable() -> str:
+    """
+    Best-effort path to the Python interpreter QGIS runs on.
+
+    On Windows, ``sys.executable`` is often ``qgis-bin.exe`` (not a usable
+    ``python.exe``), so we probe the well-known OSGeo4W locations first.
+    """
+    if os.name == "nt":
+        candidates = [
+            os.path.join(sys.prefix, "python.exe"),
+            os.path.join(sys.prefix, "python3.exe"),
+            os.path.join(sys.exec_prefix, "python.exe"),
+            os.path.join(os.path.dirname(sys.executable), "python.exe"),
+        ]
+        for cand in candidates:
+            if cand and os.path.exists(cand):
+                return cand
+    # Linux/macOS (and Windows fallback): the running interpreter is usable.
+    return sys.executable
+
+
+def _user_site_enabled() -> bool:
+    """Whether ``pip install --user`` targets a directory this Python imports from."""
+    try:
+        import site
+        return bool(getattr(site, "ENABLE_USER_SITE", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def manual_command(pip_names) -> str:
+    """The exact shell command a user can run by hand (for the fallback hint)."""
+    py = python_executable()
+    if " " in py:
+        py = f'"{py}"'
+    return f'{py} -m pip install {" ".join(pip_names)}'
+
+
+def install(pip_names, log=None, prefer_user: bool = True, timeout: int = 1800):
+    """
+    Install ``pip_names`` into the QGIS interpreter.
+
+    Strategy: try a normal install first (works on user-writable OSGeo4W
+    installs); if that fails with what looks like a permission problem and a
+    user-site is available, retry with ``--user``.
+
+    Parameters
+    ----------
+    pip_names : list[str]
+    log : callable(str) | None
+        Optional line sink (e.g. a Qt signal ``.emit``) for streaming output.
+    prefer_user : bool
+        If True and a user-site is enabled, go straight to ``--user`` (avoids
+        touching a read-only Program Files site-packages on Windows).
+    timeout : int
+        Seconds before the pip subprocess is abandoned.
+
+    Returns
+    -------
+    (ok: bool, returncode: int)
+    """
+    def _emit(line):
+        if log:
+            log(line)
+
+    pip_names = list(pip_names)
+    if not pip_names:
+        return True, 0
+
+    py = python_executable()
+    base = [py, "-m", "pip", "install", "--disable-pip-version-check"]
+
+    attempts = []
+    if prefer_user and _user_site_enabled():
+        attempts.append(base + ["--user"] + pip_names)
+        attempts.append(base + pip_names)                 # fallback: system site
+    else:
+        attempts.append(base + pip_names)                 # try system site
+        if _user_site_enabled():
+            attempts.append(base + ["--user"] + pip_names)  # fallback: user site
+
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    # Windows: keep the child console hidden.
+    creationflags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
+
+    last_rc = 1
+    for i, cmd in enumerate(attempts, 1):
+        _emit(f"$ {' '.join(cmd)}")
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=env, creationflags=creationflags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"[ERROR] Could not launch pip: {exc}")
+            return False, 1
+
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                _emit(line.rstrip("\n"))
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _emit(f"[ERROR] pip timed out after {timeout}s.")
+            return False, 1
+
+        last_rc = proc.returncode or 0
+        if last_rc == 0:
+            _emit("[OK] Install finished.")
+            return True, 0
+
+        if i < len(attempts):
+            _emit(f"[WARN] Attempt {i} failed (exit {last_rc}); retrying with a different target …")
+
+    _emit(f"[ERROR] pip failed (exit {last_rc}).")
+    return False, last_rc
