@@ -2,16 +2,14 @@
 """
 tab_routing.py
 ==============
-Tab 4 — Routing & Numerics.
+Tab 4 — Routing & Numerics (with progressive disclosure).
 
-Exposes:
-- Manning's roughness source (scalar / LULC / LCZ / raster) + channel override
-- Routing scheme (kinematic / diffusive) + diffusion weight θ
-- Confined channel cross-section routing + per-order channel widths
-- Time stepping: static Δt or adaptive CFL (target C, dt bounds, growth cap)
-- Simulation duration + output interval
-- Compute backend (CPU / GPU) + GPU precision
-- Mass-balance report + numerical floors
+Only the fields relevant to the current choices are shown:
+  • Manning source scalar → value; raster → file picker; lulc/lcz → neither.
+  • Channel-n override off → hide channel-n value.
+  • Scheme kinematic → hide diffusion θ.
+  • Channel routing off → hide per-order widths.
+  • Adaptive off → hide the CFL controls.
 """
 
 import os
@@ -22,8 +20,15 @@ from qgis.PyQt.QtWidgets import (
     QSpinBox, QRadioButton, QButtonGroup, QHBoxLayout, QLabel,
     QComboBox, QCheckBox, QLineEdit, QScrollArea, QFrame,
 )
-from qgis.PyQt.QtCore import Qt
 from qgis.gui import QgsFileWidget
+
+
+def _set_row_visible(form: QFormLayout, field, visible: bool):
+    """Show/hide a QFormLayout row (both the field and its label, if any)."""
+    field.setVisible(visible)
+    lbl = form.labelForField(field)
+    if lbl is not None:
+        lbl.setVisible(visible)
 
 
 def _cupy_available() -> bool:
@@ -49,13 +54,14 @@ class TabRouting(QWidget):
         super().__init__(parent)
         self._gpu_ok = _cupy_available()
         self._build_ui()
+        self._wire_disclosure()
+        self._apply_disclosure()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -63,7 +69,6 @@ class TabRouting(QWidget):
 
         panel = QWidget()
         scroll.setWidget(panel)
-
         root = QVBoxLayout(panel)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
@@ -80,11 +85,11 @@ class TabRouting(QWidget):
 
     def _build_mannings_group(self, root):
         grp = QGroupBox("Manning's Roughness")
-        form = QFormLayout(grp)
+        form = self._mann_form = QFormLayout(grp)
 
         self.mannings_source = QComboBox()
         self.mannings_source.addItems([
-            "scalar — uniform value below",
+            "scalar — uniform value",
             "lulc — ESA WorldCover lookup (needs GEE)",
             "lcz — WUDAPT LCZ lookup (needs GEE; also sets OPM root-zone depth)",
             "raster — pre-computed GeoTIFF",
@@ -92,32 +97,30 @@ class TabRouting(QWidget):
         form.addRow("Manning's n source:", self.mannings_source)
 
         self.mannings_n = QDoubleSpinBox()
-        self.mannings_n.setRange(0.001, 1.0)
-        self.mannings_n.setDecimals(4)
+        self.mannings_n.setRange(0.001, 1.0); self.mannings_n.setDecimals(4)
         self.mannings_n.setValue(0.09)
-        self.mannings_n.setToolTip("Uniform Manning's n / nodata fallback (typical: 0.04–0.10).")
-        form.addRow("Manning's n (scalar/fallback):", self.mannings_n)
+        self.mannings_n.setToolTip("Uniform Manning's n (typical: 0.04–0.10).")
+        form.addRow("Manning's n:", self.mannings_n)
 
         self.mannings_raster = QgsFileWidget()
         self.mannings_raster.setStorageMode(QgsFileWidget.GetFile)
         self.mannings_raster.setFilter("GeoTIFF (*.tif *.tiff);;All files (*)")
-        form.addRow("Manning's n raster (source=raster):", self.mannings_raster)
+        form.addRow("Manning's n raster:", self.mannings_raster)
 
         self.channel_n_override = QCheckBox("Override roughness on channel cells")
         self.channel_n_override.setChecked(True)
         form.addRow(self.channel_n_override)
 
         self.channel_n = QDoubleSpinBox()
-        self.channel_n.setRange(0.005, 0.5)
-        self.channel_n.setDecimals(4)
+        self.channel_n.setRange(0.005, 0.5); self.channel_n.setDecimals(4)
         self.channel_n.setValue(0.035)
-        self.channel_n.setToolTip("Uniform channel Manning's n applied to high-flow-accumulation cells.")
+        self.channel_n.setToolTip("Uniform channel Manning's n for high-flow-accumulation cells.")
         form.addRow("Channel n:", self.channel_n)
 
         self.channel_faccum = QSpinBox()
         self.channel_faccum.setRange(0, 100_000_000)
         self.channel_faccum.setSpecialValueText("auto (top ~1% of cells)")
-        self.channel_faccum.setValue(0)   # 0 → auto (None)
+        self.channel_faccum.setValue(0)
         self.channel_faccum.setToolTip("Flow-accumulation threshold that defines channel cells. 0 = auto.")
         form.addRow("Channel faccum threshold:", self.channel_faccum)
 
@@ -127,7 +130,7 @@ class TabRouting(QWidget):
 
     def _build_scheme_group(self, root):
         grp = QGroupBox("Routing Scheme")
-        form = QFormLayout(grp)
+        form = self._scheme_form = QFormLayout(grp)
 
         self.scheme_combo = QComboBox()
         self.scheme_combo.addItems([
@@ -135,46 +138,32 @@ class TabRouting(QWidget):
             "diffusive — CASC2D/GSSHA water-surface-slope diffusion wave",
         ])
         self.scheme_combo.setCurrentIndex(1)   # diffusive default
-        self.scheme_combo.currentIndexChanged.connect(self._on_scheme_changed)
         form.addRow("Scheme:", self.scheme_combo)
 
         self.diffusion_theta = QDoubleSpinBox()
-        self.diffusion_theta.setRange(0.0, 1.0)
-        self.diffusion_theta.setDecimals(2)
-        self.diffusion_theta.setValue(1.0)
-        self.diffusion_theta.setSingleStep(0.1)
-        self.diffusion_theta.setToolTip(
-            "Diffusion weight θ (diffusive scheme only).\n"
-            "0 ≈ bed-slope-only (kinematic)  |  1 = full water-surface-slope diffusion."
-        )
+        self.diffusion_theta.setRange(0.0, 1.0); self.diffusion_theta.setDecimals(2)
+        self.diffusion_theta.setValue(1.0); self.diffusion_theta.setSingleStep(0.1)
+        self.diffusion_theta.setToolTip("0 ≈ kinematic  |  1 = full water-surface-slope diffusion.")
         form.addRow("Diffusion θ:", self.diffusion_theta)
 
         root.addWidget(grp)
-
-    def _on_scheme_changed(self, idx):
-        self.diffusion_theta.setEnabled(idx == 1)
 
     # ── Channel routing ────────────────────────────────────────────────────────
 
     def _build_channel_group(self, root):
         grp = QGroupBox("Confined Channel Routing")
-        form = QFormLayout(grp)
+        form = self._channel_form = QFormLayout(grp)
 
         self.channel_routing = QCheckBox(
             "Route channel cells as a confined rectangular channel (true R = A/P)"
         )
         self.channel_routing.setChecked(True)
-        self.channel_routing.setToolTip(
-            "When on, high-flow-accumulation channel cells use a narrow width B\n"
-            "and true hydraulic radius instead of a wide sheet over the DEM cell.\n"
-            "Uses the same cells as the channel-n override."
-        )
         form.addRow(self.channel_routing)
 
         self.channel_widths = QLineEdit("3,5,8,12,18,28,45,70")
         self.channel_widths.setToolTip(
-            "Channel width B [m] per Strahler stream order, comma-separated,\n"
-            "starting at order 1.  Orders above the last value reuse the last value."
+            "Channel width B [m] per Strahler order, comma-separated, from order 1.\n"
+            "Orders above the last value reuse the last value."
         )
         form.addRow("Channel widths by order (m):", self.channel_widths)
 
@@ -184,31 +173,26 @@ class TabRouting(QWidget):
 
     def _build_time_group(self, root):
         grp = QGroupBox("Time Stepping")
-        form = QFormLayout(grp)
+        form = self._time_form = QFormLayout(grp)
 
         self.adaptive = QCheckBox("Adaptive CFL timestep (re-derive Δt each step from wave celerity)")
         self.adaptive.setChecked(True)
-        self.adaptive.toggled.connect(self._on_adaptive_toggled)
         form.addRow(self.adaptive)
 
         self.dt_spin = QDoubleSpinBox()
-        self.dt_spin.setRange(0.001, 3600.0)
-        self.dt_spin.setDecimals(3)
-        self.dt_spin.setValue(2.0)
-        self.dt_spin.setSuffix(" s")
+        self.dt_spin.setRange(0.001, 3600.0); self.dt_spin.setDecimals(3)
+        self.dt_spin.setValue(2.0); self.dt_spin.setSuffix(" s")
         self.dt_spin.setToolTip("Static / initial Δt. Used as the fallback when adaptive is off.")
         form.addRow("Time step Δt (static/initial):", self.dt_spin)
 
         self.cfl_target = QDoubleSpinBox()
-        self.cfl_target.setRange(0.05, 0.99)
-        self.cfl_target.setDecimals(2)
+        self.cfl_target.setRange(0.05, 0.99); self.cfl_target.setDecimals(2)
         self.cfl_target.setValue(0.85)
-        self.cfl_target.setToolTip("Target Courant number (higher = sharper peak, more ripple; 0.7 safe, 0.85 sharp).")
+        self.cfl_target.setToolTip("Target Courant number (0.7 safe, 0.85 sharper peak).")
         form.addRow("CFL target C:", self.cfl_target)
 
         self.cfl_dt_max = QDoubleSpinBox()
-        self.cfl_dt_max.setRange(0.0, 3600.0)
-        self.cfl_dt_max.setDecimals(2)
+        self.cfl_dt_max.setRange(0.0, 3600.0); self.cfl_dt_max.setDecimals(2)
         self.cfl_dt_max.setValue(5.0)
         self.cfl_dt_max.setSpecialValueText("auto (= output interval)")
         self.cfl_dt_max.setSuffix(" s")
@@ -216,41 +200,30 @@ class TabRouting(QWidget):
         form.addRow("CFL dt max:", self.cfl_dt_max)
 
         self.cfl_dt_min = QDoubleSpinBox()
-        self.cfl_dt_min.setRange(0.001, 60.0)
-        self.cfl_dt_min.setDecimals(3)
-        self.cfl_dt_min.setValue(0.01)
-        self.cfl_dt_min.setSuffix(" s")
+        self.cfl_dt_min.setRange(0.001, 60.0); self.cfl_dt_min.setDecimals(3)
+        self.cfl_dt_min.setValue(0.01); self.cfl_dt_min.setSuffix(" s")
         self.cfl_dt_min.setToolTip("Floor on adaptive Δt; the flux limiter covers cells needing less.")
         form.addRow("CFL dt min:", self.cfl_dt_min)
 
         self.cfl_dt_grow = QDoubleSpinBox()
-        self.cfl_dt_grow.setRange(1.0, 100.0)
-        self.cfl_dt_grow.setDecimals(2)
+        self.cfl_dt_grow.setRange(1.0, 100.0); self.cfl_dt_grow.setDecimals(2)
         self.cfl_dt_grow.setValue(1.5)
-        self.cfl_dt_grow.setToolTip("Max factor Δt may grow per step (GSSHA-style ramp-up). 1.0 disables growth caps loosely.")
+        self.cfl_dt_grow.setToolTip("Max factor Δt may grow per step (GSSHA-style ramp-up).")
         form.addRow("CFL dt growth factor:", self.cfl_dt_grow)
 
         self.sim_hours = QDoubleSpinBox()
-        self.sim_hours.setRange(0.1, 99999.0)
-        self.sim_hours.setDecimals(1)
-        self.sim_hours.setValue(96.0)
-        self.sim_hours.setSuffix(" hours")
+        self.sim_hours.setRange(0.1, 99999.0); self.sim_hours.setDecimals(1)
+        self.sim_hours.setValue(96.0); self.sim_hours.setSuffix(" hours")
         self.sim_hours.setToolTip("Total simulation length. Also sets the IMERG download window end.")
         form.addRow("Simulation duration:", self.sim_hours)
 
         self.out_interval = QSpinBox()
-        self.out_interval.setRange(1, 86400)
-        self.out_interval.setValue(600)
+        self.out_interval.setRange(1, 86400); self.out_interval.setValue(600)
         self.out_interval.setSuffix(" s")
         self.out_interval.setToolTip("How often to record a hydrograph row (600 s = 10-minute output).")
         form.addRow("Output interval:", self.out_interval)
 
         root.addWidget(grp)
-        self._on_adaptive_toggled(self.adaptive.isChecked())
-
-    def _on_adaptive_toggled(self, on):
-        for w in (self.cfl_target, self.cfl_dt_max, self.cfl_dt_min, self.cfl_dt_grow):
-            w.setEnabled(on)
 
     # ── Backend ────────────────────────────────────────────────────────────────
 
@@ -269,7 +242,7 @@ class TabRouting(QWidget):
             self._rb_gpu.setEnabled(False)
             self._rb_gpu.setToolTip(
                 "CuPy not found in this Python environment.\n"
-                "Install CuPy matching your CUDA version to enable GPU support:\n"
+                "Install CuPy matching your CUDA version:\n"
                 "  pip install cupy-cuda12x  (CUDA 12)\n"
                 "  pip install cupy-cuda11x  (CUDA 11)"
             )
@@ -279,17 +252,18 @@ class TabRouting(QWidget):
         v.addWidget(self._rb_cpu)
         v.addWidget(self._rb_gpu)
 
-        prec_row = QHBoxLayout()
-        prec_row.addWidget(QLabel("GPU precision:"))
+        self._prec_row = QHBoxLayout()
+        self._prec_label = QLabel("GPU precision:")
+        self._prec_row.addWidget(self._prec_label)
         self.precision_combo = QComboBox()
         self.precision_combo.addItems([
             "float64  (full precision, default)",
             "float32  (faster, ~1e-7 relative error)",
         ])
         self.precision_combo.setEnabled(self._gpu_ok)
-        prec_row.addWidget(self.precision_combo)
-        prec_row.addStretch()
-        v.addLayout(prec_row)
+        self._prec_row.addWidget(self.precision_combo)
+        self._prec_row.addStretch()
+        v.addLayout(self._prec_row)
 
         self._rb_gpu.toggled.connect(lambda on: self.precision_combo.setEnabled(on and self._gpu_ok))
 
@@ -308,20 +282,41 @@ class TabRouting(QWidget):
         form.addRow(self.mass_balance)
 
         self.min_slope = QDoubleSpinBox()
-        self.min_slope.setRange(1e-8, 1.0)
-        self.min_slope.setDecimals(6)
+        self.min_slope.setRange(1e-8, 1.0); self.min_slope.setDecimals(6)
         self.min_slope.setValue(1e-4)
         self.min_slope.setToolTip("Minimum slope floor in Manning's equation [m/m].")
         form.addRow("MIN_SLOPE:", self.min_slope)
 
         self.min_depth = QDoubleSpinBox()
-        self.min_depth.setRange(1e-10, 0.01)
-        self.min_depth.setDecimals(8)
+        self.min_depth.setRange(1e-10, 0.01); self.min_depth.setDecimals(8)
         self.min_depth.setValue(1e-6)
         self.min_depth.setToolTip("Minimum water depth kept to avoid numerical issues [m].")
         form.addRow("MIN_DEPTH_M:", self.min_depth)
 
         root.addWidget(grp)
+
+    # ── Progressive disclosure ─────────────────────────────────────────────────
+
+    def _wire_disclosure(self):
+        self.mannings_source.currentIndexChanged.connect(self._apply_disclosure)
+        self.channel_n_override.toggled.connect(self._apply_disclosure)
+        self.scheme_combo.currentIndexChanged.connect(self._apply_disclosure)
+        self.channel_routing.toggled.connect(self._apply_disclosure)
+        self.adaptive.toggled.connect(self._apply_disclosure)
+
+    def _apply_disclosure(self, *args):
+        src = self.mannings_source.currentIndex()   # 0 scalar,1 lulc,2 lcz,3 raster
+        _set_row_visible(self._mann_form, self.mannings_n, src == 0)
+        _set_row_visible(self._mann_form, self.mannings_raster, src == 3)
+        _set_row_visible(self._mann_form, self.channel_n, self.channel_n_override.isChecked())
+
+        _set_row_visible(self._scheme_form, self.diffusion_theta, self.scheme_combo.currentIndex() == 1)
+
+        _set_row_visible(self._channel_form, self.channel_widths, self.channel_routing.isChecked())
+
+        adaptive = self.adaptive.isChecked()
+        for w in (self.cfl_target, self.cfl_dt_max, self.cfl_dt_min, self.cfl_dt_grow):
+            _set_row_visible(self._time_form, w, adaptive)
 
     # ── Public getters ────────────────────────────────────────────────────────
 
@@ -333,7 +328,6 @@ class TabRouting(QWidget):
 
     @staticmethod
     def _parse_widths(text):
-        """Parse 'a,b,c' → {1:a, 2:b, 3:c}.  Returns None on empty/invalid."""
         try:
             vals = [float(x) for x in text.replace(";", ",").split(",") if x.strip()]
         except ValueError:
@@ -343,10 +337,9 @@ class TabRouting(QWidget):
     # ── Config I/O ────────────────────────────────────────────────────────────
 
     def apply_config(self, cfg):
-        # Manning
+        src = getattr(cfg, "MANNINGS_N_SOURCE", "scalar")
         self.mannings_source.setCurrentIndex(
-            self._MANNINGS_SOURCES.index(getattr(cfg, "MANNINGS_N_SOURCE", "scalar"))
-            if getattr(cfg, "MANNINGS_N_SOURCE", "scalar") in self._MANNINGS_SOURCES else 0
+            self._MANNINGS_SOURCES.index(src) if src in self._MANNINGS_SOURCES else 0
         )
         self.mannings_n.setValue(cfg.MANNINGS_N)
         if getattr(cfg, "MANNINGS_N_RASTER_PATH", None):
@@ -357,23 +350,19 @@ class TabRouting(QWidget):
         elif isinstance(ch_n, (int, float)):
             self.channel_n_override.setChecked(True)
             self.channel_n.setValue(float(ch_n))
-        else:  # dict — keep override on, can't represent per-order in this widget
+        else:
             self.channel_n_override.setChecked(True)
         faccum = getattr(cfg, "CHANNEL_FACCUM_THRESHOLD", None)
         self.channel_faccum.setValue(int(faccum) if faccum else 0)
 
-        # Scheme
         self.scheme_combo.setCurrentIndex(1 if getattr(cfg, "ROUTING_SCHEME", "kinematic") == "diffusive" else 0)
         self.diffusion_theta.setValue(float(getattr(cfg, "DIFFUSION_THETA", 1.0)))
 
-        # Channel routing
         self.channel_routing.setChecked(bool(getattr(cfg, "CHANNEL_ROUTING", False)))
         widths = getattr(cfg, "CHANNEL_WIDTH_BY_ORDER", None)
         if isinstance(widths, dict) and widths:
-            ordered = [widths[k] for k in sorted(widths)]
-            self.channel_widths.setText(",".join(str(v) for v in ordered))
+            self.channel_widths.setText(",".join(str(widths[k]) for k in sorted(widths)))
 
-        # Time
         self.adaptive.setChecked(bool(getattr(cfg, "ADAPTIVE_TIMESTEP", False)))
         self.dt_spin.setValue(float(cfg.TIME_STEP_SECONDS))
         self.cfl_target.setValue(float(getattr(cfg, "CFL_TARGET", 0.85)))
@@ -383,37 +372,33 @@ class TabRouting(QWidget):
         self.sim_hours.setValue(float(cfg.TOTAL_SIMULATION_TIME_HOURS))
         self.out_interval.setValue(int(cfg.OUTPUT_INTERVAL_SECONDS))
 
-        # Backend
         if cfg.BACKEND == "gpu" and self._gpu_ok:
             self._rb_gpu.setChecked(True)
         else:
             self._rb_cpu.setChecked(True)
         self.precision_combo.setCurrentIndex(0 if cfg.GPU_PRECISION == "float64" else 1)
 
-        # Advanced
         self.mass_balance.setChecked(bool(getattr(cfg, "MASS_BALANCE_REPORT", True)))
         self.min_slope.setValue(float(cfg.MIN_SLOPE))
         self.min_depth.setValue(float(cfg.MIN_DEPTH_M))
 
+        self._apply_disclosure()
+
     def write_to_config(self, cfg):
-        # Manning
         cfg.MANNINGS_N_SOURCE = self._MANNINGS_SOURCES[self.mannings_source.currentIndex()]
         cfg.MANNINGS_N = self.mannings_n.value()
         cfg.MANNINGS_N_RASTER_PATH = self.mannings_raster.filePath() or None
         cfg.MANNINGS_N_CHANNEL = self.channel_n.value() if self.channel_n_override.isChecked() else None
         cfg.CHANNEL_FACCUM_THRESHOLD = self.channel_faccum.value() or None
 
-        # Scheme
         cfg.ROUTING_SCHEME = "diffusive" if self.scheme_combo.currentIndex() == 1 else "kinematic"
         cfg.DIFFUSION_THETA = self.diffusion_theta.value()
 
-        # Channel routing
         cfg.CHANNEL_ROUTING = self.channel_routing.isChecked()
         widths = self._parse_widths(self.channel_widths.text())
         if widths:
             cfg.CHANNEL_WIDTH_BY_ORDER = widths
 
-        # Time
         cfg.ADAPTIVE_TIMESTEP = self.adaptive.isChecked()
         cfg.TIME_STEP_SECONDS = self.dt_spin.value()
         cfg.CFL_TARGET = self.cfl_target.value()
@@ -423,11 +408,9 @@ class TabRouting(QWidget):
         cfg.TOTAL_SIMULATION_TIME_HOURS = self.sim_hours.value()
         cfg.OUTPUT_INTERVAL_SECONDS = self.out_interval.value()
 
-        # Backend
         cfg.BACKEND = self.get_backend()
         cfg.GPU_PRECISION = self.get_precision()
 
-        # Advanced
         cfg.MASS_BALANCE_REPORT = self.mass_balance.isChecked()
         cfg.MIN_SLOPE = self.min_slope.value()
         cfg.MIN_DEPTH_M = self.min_depth.value()
