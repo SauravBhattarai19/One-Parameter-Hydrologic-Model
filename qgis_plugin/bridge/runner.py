@@ -151,6 +151,23 @@ class OpmWorker(QThread):
     # ── Pipeline stages ───────────────────────────────────────────────────────
 
     def _run_pipeline(self):
+        # Resolve OUTPUT_DIR to an ABSOLUTE path and pre-create it, so relative
+        # defaults (e.g. an unedited config.py "outputs collection/…") are never
+        # created under QGIS's read-only working directory.  Re-sync the derived
+        # paths so ROUTING_*/hydrograph/etc. are absolute too.
+        try:
+            self._cfg.OUTPUT_DIR = os.path.abspath(self._cfg.OUTPUT_DIR or "output")
+            if hasattr(self._cfg, "update_output_paths"):
+                self._cfg.update_output_paths()
+            os.makedirs(self._cfg.OUTPUT_DIR, exist_ok=True)
+            self.log.emit(f"[INFO] Output directory: {self._cfg.OUTPUT_DIR}")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot create the output directory '{self._cfg.OUTPUT_DIR}'. "
+                "Pick a writable folder on the DEM & Watershed tab (e.g. under "
+                "your user/Documents folder)."
+            ) from exc
+
         stages = self._stages
         n = len(stages)
 

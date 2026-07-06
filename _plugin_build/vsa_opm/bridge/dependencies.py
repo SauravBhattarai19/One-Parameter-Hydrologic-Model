@@ -82,6 +82,42 @@ def python_executable() -> str:
     return sys.executable
 
 
+def refresh_import_paths():
+    """
+    Make freshly pip-installed packages importable in the RUNNING interpreter
+    without restarting QGIS.
+
+    ``pip install`` writes to a site directory that Python only scans at
+    startup, so a running QGIS won't see the new packages.  We add the user
+    (and, if present, global) site directories to ``sys.path`` and clear the
+    import-finder caches, so a subsequent ``import rasterio`` succeeds in the
+    same session.
+
+    Returns the list of directories newly added to ``sys.path``.
+    """
+    import site
+    import importlib
+
+    dirs = []
+    try:
+        dirs.append(site.getusersitepackages())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        dirs.extend(site.getsitepackages())
+    except Exception:  # noqa: BLE001
+        pass
+
+    added = []
+    for d in dirs:
+        if d and os.path.isdir(d) and d not in sys.path:
+            sys.path.append(d)
+            added.append(d)
+
+    importlib.invalidate_caches()
+    return added
+
+
 def _user_site_enabled() -> bool:
     """Whether ``pip install --user`` targets a directory this Python imports from."""
     try:

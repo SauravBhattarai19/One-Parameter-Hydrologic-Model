@@ -107,11 +107,9 @@ class TabDem(QWidget):
         self.output_dir_widget = QgsFileWidget()
         self.output_dir_widget.setStorageMode(QgsFileWidget.GetDirectory)
         self.output_dir_widget.setDialogTitle("Select output directory")
-        # Default to OPM repo root / output
-        default_out = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "output"
-        )
+        # Default to a writable location under the user's home folder — never
+        # inside the plugin/Program Files tree (which may be read-only).
+        default_out = os.path.join(os.path.expanduser("~"), "VSA-OPM", "output")
         self.output_dir_widget.setFilePath(default_out)
         form_out.addRow("Output directory:", self.output_dir_widget)
 
