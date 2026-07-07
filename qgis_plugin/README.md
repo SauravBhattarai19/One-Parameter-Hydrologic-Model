@@ -28,22 +28,24 @@ model runs from within QGIS with optional GPU (CuPy/CUDA) acceleration.
 
 ### A. Prebuilt folder (recommended — no build step)
 
-The repository ships a self-contained plugin folder at `_plugin_build/vsa_opm/`
-that already bundles the plugin **and** all core model files.
+The repository ships a self-contained plugin folder at
+`_plugin_build/vsa_opm_plugin/` that bundles the plugin **and** a vendored
+copy of the `vsa_opm` core package (under `_vendor/`).
 
 1. Pull the repository.
-2. Copy the `_plugin_build/vsa_opm/` folder into your QGIS plugins directory:
+2. **Remove any old `vsa_opm` plugin folder** (the plugin was renamed so it no
+   longer shadows the core package's import name), then copy
+   `_plugin_build/vsa_opm_plugin/` into your QGIS plugins directory:
    - **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
    - **Linux:** `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
    - **macOS:** `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/`
-   (The folder must be named `vsa_opm`.)
 3. QGIS → **Plugins → Manage and Install Plugins → Installed → ✓ VSA-OPM Hydrological Model**
 
 ### B. Rebuild the package yourself
 
 ```bash
 cd /path/to/OPM
-./build_windows_plugin.sh      # regenerates _plugin_build/vsa_opm/ and vsa_opm_windows.zip
+./build_windows_plugin.sh      # regenerates _plugin_build/vsa_opm_plugin/ and vsa_opm_windows.zip
 ```
 
 ### C. Development symlink (Linux/macOS)
@@ -52,9 +54,9 @@ cd /path/to/OPM
 ./install_plugin.sh            # symlinks qgis_plugin/ → the QGIS plugins dir
 ./install_plugin.sh --remove   # uninstall
 ```
-> Symlink mode requires the repo root on QGIS's Python path (the plugin's runner
-> adds it automatically only for the packaged layout), so prefer **A** or **B**
-> unless you are actively editing plugin source.
+> In symlink mode the plugin finds the core package in the repository root
+> automatically (`bridge.ensure_core()`); pip-installing `vsa-opm` into the
+> QGIS interpreter also works for any install mode.
 
 ---
 
@@ -71,8 +73,8 @@ texture suction, LULC/LCZ Manning's & impervious) need Earth Engine access.
   ee.Authenticate()
   ```
 - Or place a service-account `key.json` next to `serves_gee.py` inside the
-  installed `vsa_opm/` folder. **`key.json` is never committed to git** — you
-  must supply your own.
+  installed plugin's `_vendor/vsa_opm/gee/` folder. **`key.json` is never
+  committed to git** — you must supply your own.
 - These options are entirely optional: scalar/manual/gauge settings run fully
   offline.
 
@@ -131,9 +133,10 @@ import cupy    # optional (GPU)
    routing, static or adaptive-CFL time-stepping, compute backend, mass balance.
 5. **Results** — hydrograph plot, layer loading, CSV/PNG export.
 
-Every knob maps 1:1 to an attribute on `OpmConfig` (`bridge/config_bridge.py`),
-which is a complete mirror of `config.py`. **Save Config** exports a
-`config.py`-compatible file with all parameters.
+Every knob maps 1:1 to an attribute on `OpmConfig` — defined once in the core
+package (`vsa_opm/config.py`) and re-exported by `bridge/config_bridge.py` for
+backward compatibility. **Save Config** exports a `config.py`-compatible file
+with all parameters, which also loads via `vsa-opm run -c <file>`.
 
 ---
 

@@ -1,9 +1,17 @@
 # OPM — One-Parameter Model for Variable Source Area Runoff
+#
+# The canonical dependency list lives in pyproject.toml; prefer
+#   pip install .          (core)
+#   pip install .[gpu]     (+ CuPy/CUDA)
+#   pip install .[gee]     (+ Google Earth Engine)
+# This file is kept for tooling that expects a requirements.txt.
+
 # Core scientific
 numpy
 pandas
 scipy
 matplotlib
+pyyaml
 
 # Geospatial
 rasterio
@@ -16,5 +24,5 @@ fiona
 # Optional: GPU acceleration (requires CUDA)
 # cupy-cuda12x
 
-# Optional: dynamic SD_max from SoilGrids (requires GEE auth)
+# Optional: GEE-backed inputs (IMERG, SERVES, SoilGrids, LULC/LCZ)
 # earthengine-api

@@ -41,7 +41,7 @@ Q_MIN = 0.001  # model constant [m³/s]
 
 
 def main():
-    import kinematic_wave_router as kwr
+    from vsa_opm.core.routing import router as kwr
     import rasterio
 
     print("=" * 65)
@@ -106,8 +106,8 @@ def main():
     vsa_histories = {}
 
     # Get SD params once (they don't change with Q_max)
-    from runoff_input import _resolve_sd_params, _OPM_SD_MIN
-    sd_params = _resolve_sd_params(config, cell_size)
+    from vsa_opm.core.runoff import resolve_sd_params, OPM_SD_MIN
+    sd_params = resolve_sd_params(config, cell_size)
     SD_max_initial = sd_params['sd_max']
     sd_min = sd_params['sd_min']
     phi = sd_params['phi']

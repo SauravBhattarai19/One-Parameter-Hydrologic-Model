@@ -1,8 +1,15 @@
 # config.py
 # =============================================================================
-# Configuration for the VSA / OPM distributed hydrologic model.
-# Values only — no logic.  Changing OUTPUT_DIR (§1) cascades to every path
-# derived from it.
+# LEGACY research-scenario settings for the VSA / OPM distributed hydrologic
+# model.  Values only — no logic.  Changing OUTPUT_DIR (§1) cascades to every
+# path derived from it.
+#
+# The model itself now lives in the pip-installable `vsa_opm` package and is
+# configured with vsa_opm.config.OpmConfig (YAML/JSON via the `vsa-opm` CLI).
+# This module is kept as the scenario file for the repository's research
+# workflows (tools/runner.py, tests/): they import it and pass it directly as
+# the cfg object — every core function accepts any object with these
+# attributes.  It also loads via `vsa-opm run -c config.py`.
 #
 # Contents
 #   1.  Event & scenario          ← DEM, output folder, event timing, GEE

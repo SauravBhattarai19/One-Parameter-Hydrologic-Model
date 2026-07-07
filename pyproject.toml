@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vsa-opm"
+version = "2.0.0"
+description = "Variable Source Area / One-Parameter Model (VSA-OPM) distributed hydrologic model: DEM preprocessing, gauge/IMERG precipitation, VSA + Green-Ampt + impervious runoff generation, and kinematic/diffusive-wave routing."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Saurav Bhattarai", email = "bhattaraisaurav36@gmail.com" },
+]
+keywords = ["hydrology", "watershed", "runoff", "routing", "kinematic wave", "VSA", "OPM"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Hydrology",
+]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+    "rasterio",
+    "geopandas",
+    "shapely",
+    "pyproj",
+    "pysheds",
+    "fiona",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+# GPU acceleration (requires CUDA 12.x)
+gpu = ["cupy-cuda12x"]
+# Google Earth Engine features (IMERG rainfall, SERVES deficit, SoilGrids, LULC/LCZ)
+gee = ["earthengine-api"]
+
+[project.scripts]
+vsa-opm = "vsa_opm.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/SauravBhattarai19/One-Parameter-Hydrologic-Model"
+Issues = "https://github.com/SauravBhattarai19/One-Parameter-Hydrologic-Model/issues"
+
+[tool.setuptools.packages.find]
+include = ["vsa_opm*"]
+
+[tool.setuptools.package-data]
+vsa_opm = ["data/*.csv"]

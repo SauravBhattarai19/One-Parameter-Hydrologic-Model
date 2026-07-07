@@ -26,7 +26,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_SRC="$SCRIPT_DIR/qgis_plugin"
-PLUGIN_NAME="vsa_opm"   # must match the folder name QGIS sees
+PLUGIN_NAME="vsa_opm_plugin"   # renamed: must not shadow the core "vsa_opm" package import   # must match the folder name QGIS sees
 
 # ── Detect QGIS plugin directory ─────────────────────────────────────────────
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then

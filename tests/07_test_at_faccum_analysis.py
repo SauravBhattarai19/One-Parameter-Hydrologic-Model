@@ -45,7 +45,7 @@ POLY_COLORS = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3',
 
 
 def main():
-    import kinematic_wave_router as kwr
+    from vsa_opm.core.routing import router as kwr
 
     print("=" * 65)
     print("  A_t + Flow Accumulation Analysis")

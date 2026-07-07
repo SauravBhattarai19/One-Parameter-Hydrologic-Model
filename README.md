@@ -25,30 +25,77 @@ no installation required:
 
 If you're new to this repo, start there before digging into the code below.
 
-## Running the model
+## Installation
+
+The model is a pip-installable package (`vsa_opm`):
 
 ```bash
-pip install -r requirements.txt
+pip install .            # core (CPU)
+pip install .[gpu]       # + CuPy/CUDA acceleration
+pip install .[gee]       # + Google Earth Engine (IMERG, SERVES, SoilGrids, LULC/LCZ)
 ```
 
-1. Configure a scenario in [`config.py`](config.py) — DEM path, outlet point, event
-   window, and which runoff/routing options to use.
-2. Run via [`tools/runners/`](tools/runners) (dispatches by `PRECIP_METHOD` — Thiessen,
-   IDW, or IMERG-driven variants) or directly with `vsa_opm.py`.
-3. Outputs (hydrograph, mass-balance diagnostics, rasters) are written under the
-   scenario's `OUTPUT_DIR`.
+## Running the model
 
-Optional Earth Engine integration (`OPM_SD_SOURCE='gee'`, IMERG precipitation)
-needs a GEE service account — see [`serves_gee.py`](serves_gee.py) and
-`test_ee_auth.sh` for setup/verification.
+One core drives three interfaces:
+
+**1. Python API**
+
+```python
+from vsa_opm import OpmConfig, run_pipeline
+
+cfg = OpmConfig(DEM_PATH="dem.tif", OUTPUT_DIR="results/")
+cfg.update_output_paths()
+results = run_pipeline(cfg, stages=("process_dem", "routing"))
+```
+
+**2. CLI** — config-file driven (YAML, JSON, or a legacy flat `.py` module):
+
+```bash
+vsa-opm init-config -o my_run.yaml     # template with every parameter
+vsa-opm validate -c my_run.yaml        # pre-flight checks
+vsa-opm run -c my_run.yaml             # process_dem + routing
+```
+
+See [`configs/example_config.yaml`](configs/example_config.yaml) for the
+repository's research scenario in CLI form.
+
+**3. QGIS plugin** — see [`qgis_plugin/README.md`](qgis_plugin/README.md); the
+plugin imports the same `vsa_opm` package (pip-installed or vendored in the
+plugin zip).
+
+For the repository's batch research workflows, configure
+[`config.py`](config.py) (legacy scenario module) and run
+[`tools/runner.py`](tools/runner.py), which dispatches by `PRECIP_METHOD`
+(Thiessen, IDW, or IMERG-driven variants).
+
+Outputs (hydrograph, mass-balance diagnostics, rasters) are written under the
+scenario's `OUTPUT_DIR`.  Optional Earth Engine integration
+(`OPM_SD_SOURCE='gee'`, IMERG precipitation) needs a GEE service account — see
+[`vsa_opm/gee/serves_gee.py`](vsa_opm/gee/serves_gee.py) and `test_ee_auth.sh`
+for setup/verification.
 
 ## Repository layout
 
-- `vsa_opm.py`, `runoff_input.py` — VSA/Green-Ampt runoff generation
-- `kinematic_wave_router.py`, `routing_utils.py` — channel/overland routing
-- `serves_gee.py`, `imerg_gee.py`, `process_dem.py` — satellite data & DEM pre-processing
-- `config.py` — single source of truth for all scenario parameters
+- `vsa_opm/` — the pip-installable model package
+  - `core/` — the science (QGIS-free)
+    - `routing/` — `terrain.py` (D8/slopes/topological order), `hydraulics.py`
+      (Manning + diffusive-wave kernels), `surface.py` (Manning's n, channel
+      geometry, impervious), `router.py` (the time loop), `reporting.py`
+      (hydrograph/mass balance), `gpu.py` (CuPy variants)
+    - `runoff/` — `engine.py` (RunoffEngine dispatcher), `vsa.py` (VSA-OPM /
+      Green-Ampt / impervious mechanics), `soil.py` (SD_max/phi/suction
+      resolution), `gpu.py`
+    - `precip/` — `engine.py` (uniform/Thiessen/IDW/IMERG), `gpu.py`
+    - `dem_processing.py` — watershed preprocessing (pysheds)
+    - `opm.py` — standalone OPM runner; `io_utils.py` — shared raster helpers
+  - `gee/` — Earth Engine integrations (`auth.py`, `serves_gee.py`, `imerg_gee.py`)
+  - `cli/` — the `vsa-opm` command-line interface
+  - `config.py` — `OpmConfig`, the single configuration object
+  - `pipeline.py` — stage orchestration shared by API, CLI and plugin
+- `config.py` — legacy research-scenario settings used by `tools/` and `tests/`
+- `configs/` — example CLI config files
 - `tools/` — batch runners, sensitivity/OFAT sweeps, experiment combinations
 - `study/` — source for the interactive course site above
 - `docs/` — LaTeX lecture notes companion to the course
-- `qgis_plugin/` — QGIS front-end for the model
+- `qgis_plugin/` — QGIS front-end (UI + QThread worker importing `vsa_opm`)

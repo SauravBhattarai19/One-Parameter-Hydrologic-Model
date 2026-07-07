@@ -47,7 +47,7 @@ def apply_output_dir(config, out_dir):
     config.ROUTING_FLOW_ACCUM_PATH     = out_dir + "clipped_flow_accumulation.tif"
     config.ROUTING_WATERSHED_MASK_PATH = out_dir + "watershed.tif"
     config.OPM_WATERSHED_GEOJSON       = out_dir + "watershed.geojson"
-    config.OPM_DEFICIT_RASTER          = None   # date-stamped per event in _resolve_sd_params
+    config.OPM_DEFICIT_RASTER          = None   # date-stamped per event in resolve_sd_params
     config.PRECIP_IMERG_DIR            = out_dir + "imerg/"
     config.HYDROGRAPH_CSV              = out_dir + "hydrograph.csv"
     config.MASS_BALANCE_CSV            = out_dir + "mass_balance.csv"
@@ -70,10 +70,9 @@ def run_process_dem(config, out_dir, skip_if_exists=False) -> float:
     if skip_if_exists and all(os.path.exists(p) for p in needed):
         print("  [process_dem] watershed rasters already present — skipping.")
         return 0.0
-    import process_dem
-    process_dem.OUTPUT_DIR = config.OUTPUT_DIR   # in case it was already imported
+    from vsa_opm.core import dem_processing as process_dem
     t0 = time.perf_counter()
-    process_dem.main()
+    process_dem.main(config)
     return time.perf_counter() - t0
 
 

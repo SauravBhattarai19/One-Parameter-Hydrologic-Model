@@ -21,7 +21,7 @@ set -euo pipefail
 
 OPM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPM_ENV="opm"   # your conda environment name
-PLUGIN_NAME="vsa_opm"
+PLUGIN_NAME="vsa_opm_plugin"   # renamed: must not shadow the core "vsa_opm" package import
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
