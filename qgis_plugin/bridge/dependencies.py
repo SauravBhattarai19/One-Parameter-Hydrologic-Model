@@ -13,6 +13,13 @@ the *system* Python, so QGIS still can't import it.  This module locates the
 QGIS interpreter and drives ``pip`` against it, so the user never has to find
 the OSGeo4W Shell.
 
+It is written to survive the usual cross-platform pitfalls without user
+intervention: ``sys.executable`` pointing at the QGIS/OSGeo4W launcher instead
+of a real ``python`` (probe & validate candidate interpreters), a Python that
+ships without ``pip`` (bootstrap via ``ensurepip``), read-only site-packages
+(retry with ``--user``), and PEP 668 "externally-managed" environments (retry
+with ``--break-system-packages``).
+
 Public API
 ----------
     REQUIRED, OPTIONAL          – [(import_name, pip_name, purpose), …]
@@ -61,25 +68,105 @@ def missing(include_optional: bool = False):
     return [(mod, pip, why) for (mod, pip, why) in items if not is_available(mod)]
 
 
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # hide child console on Windows
+
+
+def _looks_like_python(path: str) -> bool:
+    """Cheap name check: does this path look like a python interpreter (not, e.g.,
+    the ``qgis-bin.exe`` / ``QGIS`` app binary that ``sys.executable`` may point to)?"""
+    if not path:
+        return False
+    name = os.path.basename(path).lower()
+    return name.startswith("python") or name.startswith("pythonw")
+
+
+def _validate_interpreter(path: str) -> bool:
+    """True if ``path`` exists and is a runnable Python (we actually launch it).
+
+    This is what lets us reject the QGIS app binary that some builds expose as
+    ``sys.executable`` on macOS/Windows — running it would relaunch QGIS, not
+    Python, so we probe with a trivial ``-c`` and require a clean exit.
+    """
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        proc = subprocess.run(
+            [path, "-c", "import sys; sys.exit(0)"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=20, creationflags=_CREATE_NO_WINDOW,
+        )
+        return proc.returncode == 0
+    except Exception:  # noqa: BLE001 — anything means "not a usable interpreter"
+        return False
+
+
+def _candidate_interpreters():
+    """Ordered, de-duplicated list of paths that might be *this* environment's
+    Python, derived from where the running install actually lives.
+
+    Works across OSGeo4W (Windows), the QGIS.app framework build (macOS),
+    system/conda installs (Linux) and virtualenvs, because it is driven by
+    ``sysconfig`` / ``sys.prefix`` rather than hard-coded product paths.
+    """
+    major, minor = sys.version_info[:2]
+    if os.name == "nt":
+        names = ["python.exe", "python3.exe", f"python{major}.exe", f"python{major}{minor}.exe"]
+    else:
+        names = [f"python{major}.{minor}", "python3", f"python{major}", "python"]
+
+    # Directories that plausibly hold this environment's interpreter.
+    dirs = []
+    try:
+        import sysconfig
+        for d in (sysconfig.get_config_var("BINDIR"), sysconfig.get_path("scripts")):
+            if d:
+                dirs.append(d)
+    except Exception:  # noqa: BLE001
+        pass
+    for base in (sys.prefix, sys.exec_prefix,
+                 getattr(sys, "base_prefix", ""), getattr(sys, "base_exec_prefix", "")):
+        if not base:
+            continue
+        dirs.append(base)                       # Windows: python.exe sits in the prefix root
+        dirs.append(os.path.join(base, "bin"))  # POSIX / macOS framework
+        dirs.append(os.path.join(base, "Scripts"))  # Windows venv
+    exe_dir = os.path.dirname(sys.executable) if sys.executable else ""
+    if exe_dir:
+        dirs.append(exe_dir)
+        dirs.append(os.path.join(exe_dir, "bin"))
+
+    seen, cands = set(), []
+    for d in dirs:
+        for n in names:
+            cand = os.path.join(d, n)
+            if cand not in seen:
+                seen.add(cand)
+                cands.append(cand)
+    return cands
+
+
 def python_executable() -> str:
     """
     Best-effort path to the Python interpreter QGIS runs on.
 
-    On Windows, ``sys.executable`` is often ``qgis-bin.exe`` (not a usable
-    ``python.exe``), so we probe the well-known OSGeo4W locations first.
+    ``sys.executable`` is unreliable inside QGIS: on Windows it is often
+    ``qgis-bin.exe`` and on some macOS builds it is the ``QGIS.app`` binary —
+    neither can run ``-m pip``.  Strategy:
+
+    1. If ``sys.executable`` looks like *and* validates as a real Python, use it.
+    2. Otherwise probe interpreters derived from this install's own prefixes
+       (OSGeo4W, the macOS framework bin, conda/system, virtualenvs) and return
+       the first one that actually runs.
+    3. Fall back to ``sys.executable`` so ``manual_command`` still prints
+       something the user can adapt by hand.
     """
-    if os.name == "nt":
-        candidates = [
-            os.path.join(sys.prefix, "python.exe"),
-            os.path.join(sys.prefix, "python3.exe"),
-            os.path.join(sys.exec_prefix, "python.exe"),
-            os.path.join(os.path.dirname(sys.executable), "python.exe"),
-        ]
-        for cand in candidates:
-            if cand and os.path.exists(cand):
-                return cand
-    # Linux/macOS (and Windows fallback): the running interpreter is usable.
-    return sys.executable
+    exe = sys.executable
+    if _looks_like_python(exe) and _validate_interpreter(exe):
+        return exe
+    for cand in _candidate_interpreters():
+        if _validate_interpreter(cand):
+            return cand
+    return exe
 
 
 def refresh_import_paths():
@@ -135,6 +222,34 @@ def manual_command(pip_names) -> str:
     return f'{py} -m pip install {" ".join(pip_names)}'
 
 
+def _ensure_pip(py: str, emit=None) -> bool:
+    """Make sure ``py -m pip`` works; bootstrap it with ``ensurepip`` if not.
+
+    Some minimal QGIS/framework Pythons ship without pip.  Returns True once
+    ``pip`` is importable by ``py``.
+    """
+    def _run(cmd):
+        try:
+            return subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=300, creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    r = _run([py, "-m", "pip", "--version"])
+    if r is not None and r.returncode == 0:
+        return True
+    if emit:
+        emit("[INFO] pip not available in the QGIS Python; bootstrapping with ensurepip …")
+    r = _run([py, "-m", "ensurepip", "--default-pip"])
+    if emit and r is not None and r.stdout:
+        for ln in r.stdout.splitlines():
+            emit(ln.rstrip())
+    r = _run([py, "-m", "pip", "--version"])
+    return bool(r is not None and r.returncode == 0)
+
+
 def install(pip_names, log=None, prefer_user: bool = True, timeout: int = 1800):
     """
     Install ``pip_names`` into the QGIS interpreter.
@@ -167,29 +282,40 @@ def install(pip_names, log=None, prefer_user: bool = True, timeout: int = 1800):
         return True, 0
 
     py = python_executable()
-    base = [py, "-m", "pip", "install", "--disable-pip-version-check"]
+    if not _ensure_pip(py, _emit):
+        _emit("[ERROR] pip is unavailable in the QGIS Python and ensurepip could not bootstrap it.")
+        _emit(f"[HINT] Install manually, then restart QGIS:\n    {manual_command(pip_names)}")
+        return False, 1
 
+    base = [py, "-m", "pip", "install", "--disable-pip-version-check"]
+    user_ok = _user_site_enabled()
+
+    # Ordered install strategies; more may be appended mid-loop if pip's output
+    # tells us the environment needs a different flag (e.g. PEP 668).
     attempts = []
-    if prefer_user and _user_site_enabled():
+    if prefer_user and user_ok:
         attempts.append(base + ["--user"] + pip_names)
         attempts.append(base + pip_names)                 # fallback: system site
     else:
         attempts.append(base + pip_names)                 # try system site
-        if _user_site_enabled():
+        if user_ok:
             attempts.append(base + ["--user"] + pip_names)  # fallback: user site
 
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
-    # Windows: keep the child console hidden.
-    creationflags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
 
+    tried_break_system = False
     last_rc = 1
-    for i, cmd in enumerate(attempts, 1):
+    i = 0
+    while i < len(attempts):
+        cmd = attempts[i]
+        i += 1
         _emit(f"$ {' '.join(cmd)}")
+        buf = []
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, env=env, creationflags=creationflags,
+                text=True, env=env, creationflags=_CREATE_NO_WINDOW,
             )
         except Exception as exc:  # noqa: BLE001
             _emit(f"[ERROR] Could not launch pip: {exc}")
@@ -197,7 +323,9 @@ def install(pip_names, log=None, prefer_user: bool = True, timeout: int = 1800):
 
         try:
             for line in iter(proc.stdout.readline, ""):
-                _emit(line.rstrip("\n"))
+                line = line.rstrip("\n")
+                buf.append(line)
+                _emit(line)
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -209,8 +337,22 @@ def install(pip_names, log=None, prefer_user: bool = True, timeout: int = 1800):
             _emit("[OK] Install finished.")
             return True, 0
 
+        blob = "\n".join(buf).lower()
+        # PEP 668: interpreter refuses to install into an "externally-managed"
+        # environment (Homebrew / some distro & conda Pythons).  Retry once,
+        # opting in explicitly.
+        if not tried_break_system and "externally-managed-environment" in blob:
+            tried_break_system = True
+            _emit("[WARN] Environment is externally managed; retrying with --break-system-packages …")
+            retry = base + ["--break-system-packages"]
+            if user_ok:
+                retry += ["--user"]
+            attempts.append(retry + pip_names)
+            continue
+
         if i < len(attempts):
-            _emit(f"[WARN] Attempt {i} failed (exit {last_rc}); retrying with a different target …")
+            _emit(f"[WARN] Attempt failed (exit {last_rc}); retrying with a different target …")
 
     _emit(f"[ERROR] pip failed (exit {last_rc}).")
+    _emit(f"[HINT] Install manually, then restart QGIS:\n    {manual_command(pip_names)}")
     return False, last_rc
