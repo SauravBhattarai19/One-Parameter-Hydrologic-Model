@@ -20,7 +20,9 @@ IMERG panel here only carries the weighting/download knobs.
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QGroupBox, QComboBox,
     QDoubleSpinBox, QLabel, QStackedWidget, QCheckBox,
+    QLineEdit, QDateTimeEdit,
 )
+from qgis.PyQt.QtCore import QDateTime
 from qgis.gui import QgsFileWidget
 
 
@@ -76,7 +78,66 @@ class TabPrecip(QWidget):
         self._stack.addWidget(self._build_imerg_panel("imerg_idw"))       # 4
 
         root.addWidget(self._stack)
+
+        # ── Earth Engine (satellite data) ─────────────────────────────────────
+        root.addWidget(self._build_ee_group())
         root.addStretch()
+
+    def _build_ee_group(self):
+        """Earth Engine account + event window.
+
+        Only IMERG rainfall (and SERVES soil moisture on the Runoff tab) need
+        these; a gauge-only run can leave them blank.  This is the canonical home
+        for GEE_PROJECT / EVENT_START_UTC / IMERG_UTC_OFFSET_HOURS — the Runoff
+        tab shows a mirror of just the project id.
+        """
+        grp = QGroupBox("Earth Engine  (only for IMERG rainfall / SERVES soil moisture)")
+        form = QFormLayout(grp)
+
+        self.gee_project = QLineEdit()
+        self.gee_project.setPlaceholderText(
+            "ee-yourusername  (or leave blank to use the GEE_PROJECT env var)")
+        self.gee_project.setToolTip(
+            "Google Earth Engine cloud project ID.\n"
+            "Required for IMERG rainfall, SERVES deficit, gridded Ksat, and\n"
+            "LULC/LCZ downloads.  Authenticate GEE once in the QGIS Python\n"
+            "console (import ee; ee.Authenticate()) or place a key.json beside\n"
+            "the plugin's serves_gee.py.  Not needed for DEM preprocessing or\n"
+            "gauge-based rainfall."
+        )
+        form.addRow("GEE project:", self.gee_project)
+
+        self.use_event = QCheckBox("Set an event start date (UTC)")
+        self.use_event.setToolTip(
+            "Required for IMERG rainfall and SERVES soil-moisture deficit.\n"
+            "The IMERG download window and the SERVES antecedent-moisture date\n"
+            "are both derived from this single timestamp."
+        )
+        self.use_event.toggled.connect(self._on_use_event_toggled)
+        form.addRow(self.use_event)
+
+        self.event_dt = QDateTimeEdit()
+        self.event_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.event_dt.setCalendarPopup(True)
+        self.event_dt.setDateTime(QDateTime.currentDateTimeUtc())
+        self.event_dt.setEnabled(False)
+        form.addRow("Event start (UTC):", self.event_dt)
+
+        self.utc_offset = QDoubleSpinBox()
+        self.utc_offset.setRange(-12.0, 14.0)
+        self.utc_offset.setDecimals(2)
+        self.utc_offset.setValue(5.75)   # Nepal Standard Time (UTC+5:45)
+        self.utc_offset.setSuffix(" h")
+        self.utc_offset.setToolTip(
+            "UTC offset for local-time conversion of the IMERG window.\n"
+            "Nepal Standard Time = UTC + 5:45 → 5.75.  Use 0 to work in UTC."
+        )
+        form.addRow("UTC offset:", self.utc_offset)
+
+        return grp
+
+    def _on_use_event_toggled(self, on):
+        self.event_dt.setEnabled(on)
 
     def _build_uniform_panel(self):
         w = QGroupBox("Uniform Rainfall Parameters")
@@ -139,8 +200,8 @@ class TabPrecip(QWidget):
 
         note = QLabel(
             "Downloads IMERG V07 pixels as pseudo-gauges over the watershed.\n"
-            "Requires a GEE project + event start date (set on the DEM tab).\n"
-            "The window is EVENT_START_UTC … +simulation-duration."
+            "Requires a GEE project + event start date (set in the Earth Engine\n"
+            "section below).  The window is EVENT_START_UTC … +simulation-duration."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -197,12 +258,32 @@ class TabPrecip(QWidget):
         self._imerg_th_force.setChecked(force)
         self._imerg_idw_force.setChecked(force)
 
+        # Earth Engine + event window
+        if getattr(cfg, "EVENT_START_UTC", None):
+            self.use_event.setChecked(True)
+            dt = QDateTime.fromString(str(cfg.EVENT_START_UTC).strip(), "yyyy-MM-dd HH:mm")
+            if dt.isValid():
+                self.event_dt.setDateTime(dt)
+        else:
+            self.use_event.setChecked(False)
+        self.utc_offset.setValue(float(getattr(cfg, "IMERG_UTC_OFFSET_HOURS", 5.75)))
+        if getattr(cfg, "GEE_PROJECT", None):
+            self.gee_project.setText(str(cfg.GEE_PROJECT))
+
     def write_to_config(self, cfg):
         method = self.get_method()
         cfg.PRECIP_METHOD = method
         cfg.PRECIP_EXCLUDE_OUTSIDE_STATIONS = self.exclude_outside.isChecked()
         cfg.RAIN_INTENSITY_MM_HR = self.intensity_spin.value()
         cfg.RAIN_DURATION_HOURS = self.duration_spin.value()
+
+        # Earth Engine + event window (canonical home for these settings)
+        if self.use_event.isChecked():
+            cfg.EVENT_START_UTC = self.event_dt.dateTime().toString("yyyy-MM-dd HH:mm")
+        else:
+            cfg.EVENT_START_UTC = None
+        cfg.IMERG_UTC_OFFSET_HOURS = self.utc_offset.value()
+        cfg.GEE_PROJECT = self.gee_project.text().strip() or None
 
         if method == "thiessen":
             cfg.PRECIP_GAUGE_FILE = self._thiessen_gauge.filePath()

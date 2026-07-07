@@ -167,3 +167,67 @@ class OpmWorker(QThread):
             cp.get_default_pinned_memory_pool().free_all_blocks()
         except Exception:  # noqa: BLE001
             pass  # CuPy not available or no device — nothing to free
+
+
+# ── Interactive DEM-step worker ────────────────────────────────────────────────
+
+class DemStepWorker(QThread):
+    """
+    Runs a single interactive DEM step off the GUI thread so the canvas stays
+    responsive while pysheds works (fill_depressions can take a while).
+
+    Used by the guided Tab-1 workflow:
+        'analyze_terrain' → dem_processing.analyze_terrain(...)   (draw streams)
+        'delineate'       → dem_processing.delineate_from_outlet(...) (watershed)
+
+    Emits the same signal shape as OpmWorker so the dialog can wire them
+    interchangeably.  The result dict always carries a "task" key identifying
+    which step finished, plus the core function's returned output paths.
+    """
+
+    progress = pyqtSignal(int)          # 0–100 (steps run indeterminate; kept for parity)
+    log = pyqtSignal(str)               # one log line
+    finished = pyqtSignal(dict)         # {"task": ..., <output paths>}
+    error = pyqtSignal(str)             # error message
+
+    def __init__(self, task, params, parent=None):
+        super().__init__(parent)
+        self._task = task               # "analyze_terrain" | "delineate"
+        self._params = dict(params)
+        self._result = {}
+
+    def run(self):
+        """Called by QThread.start().  Runs in the worker thread."""
+        ensure_core()
+
+        original_stdout = sys.stdout
+        sys.stdout = _StdoutCapture(self.log)
+        try:
+            from vsa_opm.core import dem_processing as dp
+
+            if self._task == "analyze_terrain":
+                out = dp.analyze_terrain(
+                    self._params["dem_path"],
+                    self._params["target_crs_epsg"],
+                    self._params["output_dir"],
+                )
+            elif self._task == "delineate":
+                out = dp.delineate_from_outlet(
+                    self._params["output_dir"],
+                    self._params["output_point_latlon"],
+                    self._params["target_crs_epsg"],
+                )
+            else:
+                raise ValueError(f"Unknown DEM step: {self._task!r}")
+
+            self._result = {"task": self._task, **(out or {})}
+            self.finished.emit(self._result)
+        except Exception:  # noqa: BLE001
+            tb = traceback.format_exc()
+            self.log.emit(tb)
+            self.error.emit(
+                f"The '{self._task}' step failed.\n\n{tb.splitlines()[-1]}"
+            )
+        finally:
+            sys.stdout = original_stdout
+            OpmWorker._release_gpu_memory()

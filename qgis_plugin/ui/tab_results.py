@@ -12,14 +12,11 @@ Features
 - Peak discharge & timing summary label
 """
 
-import os
-
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QGroupBox, QSizePolicy, QFrame,
 )
 from qgis.PyQt.QtCore import Qt
-from qgis.core import QgsRasterLayer, QgsVectorLayer, QgsProject
 
 # Matplotlib embedded in Qt (optional — graceful fallback if not available)
 try:
@@ -175,7 +172,7 @@ class TabResults(QWidget):
 
     def _load_layers(self):
         """Add output rasters and vector layers to the QGIS project."""
-        project = QgsProject.instance()
+        from .layer_utils import add_raster, add_vector
         loaded = []
 
         layer_defs = [
@@ -188,14 +185,8 @@ class TabResults(QWidget):
 
         for key, name, kind in layer_defs:
             path = self._result.get(key)
-            if not path or not os.path.exists(path):
-                continue
-            if kind == "raster":
-                lyr = QgsRasterLayer(path, name)
-            else:
-                lyr = QgsVectorLayer(path, name, "ogr")
-            if lyr.isValid():
-                project.addMapLayer(lyr)
+            lyr = add_raster(path, name) if kind == "raster" else add_vector(path, name)
+            if lyr is not None:
                 loaded.append(name)
 
         if loaded:

@@ -2,40 +2,50 @@
 """
 tab_dem.py
 ==========
-Tab 1 — DEM & Watershed Setup.
+Tab 1 — DEM & Watershed Setup (guided two-step workflow).
 
-Widgets
--------
-- DEM file picker  (QgsFileWidget)
-- CRS selector     (QgsProjectionSelectionWidget)
-- Outlet point: lat/lon spinboxes  +  "Pick from map" button
-- Output directory (QgsFileWidget, folder mode)
-- [Run DEM Processing] button (runs process_dem only)
+Step 1 — Digital Elevation Model
+    DEM file + target CRS, then [🏔 Analyze terrain].  This runs the
+    outlet-independent terrain analysis (fill → flow direction → flow
+    accumulation) and draws the stream network on the map canvas.
+
+Step 2 — Watershed Outlet
+    With the streams visible, pick the outlet on the map (or type lat/lon),
+    then [💧 Delineate watershed].
+
+The tab itself does no threading or Earth Engine work — it only emits
+``request_analyze_terrain`` / ``request_delineate``; the main dialog runs the
+background worker and loads the resulting layers.  Earth Engine / event settings
+now live on the Precipitation and Runoff tabs (they are not needed for DEM
+preprocessing at all).
 """
 
 import os
 
 from qgis.PyQt.QtWidgets import (
     QWidget, QFormLayout, QGroupBox, QVBoxLayout, QHBoxLayout,
-    QPushButton, QDoubleSpinBox, QLabel, QSizePolicy,
-    QLineEdit, QCheckBox, QDateTimeEdit,
+    QPushButton, QDoubleSpinBox, QLabel,
 )
-from qgis.PyQt.QtCore import Qt, pyqtSignal, QDateTime
+from qgis.PyQt.QtCore import pyqtSignal
 from qgis.gui import QgsFileWidget, QgsProjectionSelectionWidget, QgsMapToolEmitPoint
 from qgis.core import QgsCoordinateReferenceSystem, QgsPointXY
 
 
 class TabDem(QWidget):
-    """DEM & Watershed configuration tab."""
+    """DEM & Watershed configuration tab (guided two-step)."""
 
     # Emitted when the user picks a point on the map
     outlet_picked = pyqtSignal(float, float)   # lat, lon
+    # Emitted when the user asks to run a DEM step (handled by the main dialog)
+    request_analyze_terrain = pyqtSignal()
+    request_delineate = pyqtSignal()
 
     def __init__(self, iface, parent=None):
         super().__init__(parent)
         self._iface = iface
-        self._map_tool = None   # QgsMapToolEmitPoint instance
-        self._prev_tool = None  # map tool active before picking
+        self._map_tool = None    # QgsMapToolEmitPoint instance
+        self._prev_tool = None   # map tool active before picking
+        self._terrain_ready = False
         self._build_ui()
 
     # ── UI construction ────────────────────────────────────────────────────────
@@ -45,25 +55,46 @@ class TabDem(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        # ── DEM Input ────────────────────────────────────────────────────────
-        grp_dem = QGroupBox("Digital Elevation Model")
+        # ── Step 1 · DEM Input ───────────────────────────────────────────────
+        grp_dem = QGroupBox("1 · Digital Elevation Model")
         form_dem = QFormLayout(grp_dem)
 
         self.dem_widget = QgsFileWidget()
         self.dem_widget.setStorageMode(QgsFileWidget.GetFile)
         self.dem_widget.setFilter("GeoTIFF (*.tif *.tiff);;All files (*)")
         self.dem_widget.setDialogTitle("Select DEM raster")
+        self.dem_widget.fileChanged.connect(self._invalidate_terrain)
         form_dem.addRow("DEM file:", self.dem_widget)
 
         self.crs_widget = QgsProjectionSelectionWidget()
         self.crs_widget.setCrs(QgsCoordinateReferenceSystem("EPSG:32645"))
+        self.crs_widget.crsChanged.connect(self._invalidate_terrain)
         form_dem.addRow("Target CRS:", self.crs_widget)
+
+        self.analyze_btn = QPushButton("🏔  Analyze terrain")
+        self.analyze_btn.setToolTip(
+            "Reproject the DEM and compute flow direction / flow accumulation,\n"
+            "then draw the stream network on the map so you can pick an outlet.\n"
+            "No pour point or Earth Engine account is needed for this step."
+        )
+        self.analyze_btn.clicked.connect(self.request_analyze_terrain.emit)
+        analyze_row = QHBoxLayout()
+        analyze_row.addStretch()
+        analyze_row.addWidget(self.analyze_btn)
+        form_dem.addRow(analyze_row)
 
         root.addWidget(grp_dem)
 
-        # ── Outlet Point ─────────────────────────────────────────────────────
-        grp_outlet = QGroupBox("Watershed Outlet Point")
+        # ── Step 2 · Outlet Point ────────────────────────────────────────────
+        grp_outlet = QGroupBox("2 · Watershed Outlet")
         v_outlet = QVBoxLayout(grp_outlet)
+
+        self._outlet_hint = QLabel(
+            "Run “Analyze terrain” first — then pick your outlet on a stream."
+        )
+        self._outlet_hint.setWordWrap(True)
+        self._outlet_hint.setStyleSheet("color: #666;")
+        v_outlet.addWidget(self._outlet_hint)
 
         coord_row = QHBoxLayout()
 
@@ -79,7 +110,7 @@ class TabDem(QWidget):
         self.lon_spin.setValue(85.293333)
         self.lon_spin.setSuffix("°  (lon)")
 
-        self.pick_btn = QPushButton("📍  Pick from map")
+        self.pick_btn = QPushButton("📍  Pick on map")
         self.pick_btn.setToolTip(
             "Click on the QGIS map canvas to set the outlet point.\n"
             "The map must be in a geographic CRS (EPSG:4326) or the\n"
@@ -96,8 +127,20 @@ class TabDem(QWidget):
         coord_row.addSpacing(10)
         coord_row.addWidget(self.pick_btn)
         coord_row.addStretch()
-
         v_outlet.addLayout(coord_row)
+
+        self.delineate_btn = QPushButton("💧  Delineate watershed")
+        self.delineate_btn.setToolTip(
+            "Snap the outlet to the stream network and delineate the\n"
+            "contributing watershed, then clip the DEM to it."
+        )
+        self.delineate_btn.setEnabled(False)   # enabled once terrain is analyzed
+        self.delineate_btn.clicked.connect(self.request_delineate.emit)
+        delin_row = QHBoxLayout()
+        delin_row.addStretch()
+        delin_row.addWidget(self.delineate_btn)
+        v_outlet.addLayout(delin_row)
+
         root.addWidget(grp_outlet)
 
         # ── Output Directory ─────────────────────────────────────────────────
@@ -114,54 +157,45 @@ class TabDem(QWidget):
         form_out.addRow("Output directory:", self.output_dir_widget)
 
         root.addWidget(grp_out)
-
-        # ── Event & Earth Engine (needed for IMERG / SERVES) ─────────────────
-        grp_evt = QGroupBox("Event & Earth Engine  (for IMERG rainfall / SERVES soil moisture)")
-        form_evt = QFormLayout(grp_evt)
-
-        self.use_event = QCheckBox("Set an event start date (UTC)")
-        self.use_event.setToolTip(
-            "Required for IMERG rainfall and SERVES soil-moisture deficit.\n"
-            "The IMERG download window and the SERVES antecedent-moisture date\n"
-            "are both derived from this single timestamp."
-        )
-        self.use_event.toggled.connect(self._on_use_event_toggled)
-        form_evt.addRow(self.use_event)
-
-        self.event_dt = QDateTimeEdit()
-        self.event_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
-        self.event_dt.setCalendarPopup(True)
-        self.event_dt.setDateTime(QDateTime.currentDateTimeUtc())
-        self.event_dt.setEnabled(False)
-        form_evt.addRow("Event start (UTC):", self.event_dt)
-
-        self.utc_offset = QDoubleSpinBox()
-        self.utc_offset.setRange(-12.0, 14.0)
-        self.utc_offset.setDecimals(2)
-        self.utc_offset.setValue(5.75)   # Nepal Standard Time (UTC+5:45)
-        self.utc_offset.setSuffix(" h")
-        self.utc_offset.setToolTip(
-            "UTC offset for local-time conversion of the IMERG window.\n"
-            "Nepal Standard Time = UTC + 5:45 → 5.75.  Use 0 to work in UTC."
-        )
-        form_evt.addRow("UTC offset:", self.utc_offset)
-
-        self.gee_project = QLineEdit()
-        self.gee_project.setPlaceholderText("ee-yourusername  (or leave blank to use the GEE_PROJECT env var)")
-        self.gee_project.setToolTip(
-            "Google Earth Engine cloud project ID.\n"
-            "Required for IMERG rainfall, SERVES deficit, gridded Ksat, and\n"
-            "LULC/LCZ downloads.  Authenticate GEE once in the QGIS Python\n"
-            "console (import ee; ee.Authenticate()) or place a key.json beside\n"
-            "the plugin's serves_gee.py."
-        )
-        form_evt.addRow("GEE project:", self.gee_project)
-
-        root.addWidget(grp_evt)
         root.addStretch()
 
-    def _on_use_event_toggled(self, on):
-        self.event_dt.setEnabled(on)
+    # ── Guided-workflow state (driven by the main dialog) ──────────────────────
+
+    def set_terrain_ready(self, ready: bool):
+        """Enable outlet picking / delineation once terrain analysis has run."""
+        self._terrain_ready = bool(ready)
+        self.delineate_btn.setEnabled(self._terrain_ready)
+        self.pick_btn.setEnabled(self._terrain_ready)
+        if ready:
+            self._outlet_hint.setText(
+                "Streams are on the map — pick your outlet on a stream, "
+                "then “Delineate watershed”."
+            )
+            self._outlet_hint.setStyleSheet("color: #1B6CA8;")
+        else:
+            self._outlet_hint.setText(
+                "Run “Analyze terrain” first — then pick your outlet on a stream."
+            )
+            self._outlet_hint.setStyleSheet("color: #666;")
+
+    def set_busy(self, busy: bool):
+        """Disable the step buttons while a background DEM step is running."""
+        self.analyze_btn.setEnabled(not busy)
+        if busy:
+            self.delineate_btn.setEnabled(False)
+        else:
+            self.delineate_btn.setEnabled(self._terrain_ready)
+
+    def activate_pick(self):
+        """Programmatically switch the map into outlet-pick mode."""
+        if not self.pick_btn.isChecked():
+            self.pick_btn.setChecked(True)
+            self._toggle_map_pick(True)
+
+    def _invalidate_terrain(self, *args):
+        """DEM or CRS changed → the analyzed terrain is stale; require re-analyze."""
+        if self._terrain_ready:
+            self.set_terrain_ready(False)
 
     # ── Map-pick tool ─────────────────────────────────────────────────────────
 
@@ -227,18 +261,6 @@ class TabDem(QWidget):
         if cfg.OUTPUT_DIR:
             self.output_dir_widget.setFilePath(cfg.OUTPUT_DIR)
 
-        # Event & GEE
-        if getattr(cfg, "EVENT_START_UTC", None):
-            self.use_event.setChecked(True)
-            dt = QDateTime.fromString(str(cfg.EVENT_START_UTC).strip(), "yyyy-MM-dd HH:mm")
-            if dt.isValid():
-                self.event_dt.setDateTime(dt)
-        else:
-            self.use_event.setChecked(False)
-        self.utc_offset.setValue(float(getattr(cfg, "IMERG_UTC_OFFSET_HOURS", 5.75)))
-        if getattr(cfg, "GEE_PROJECT", None):
-            self.gee_project.setText(str(cfg.GEE_PROJECT))
-
     def write_to_config(self, cfg):
         """Write widget values into an OpmConfig object."""
         cfg.DEM_PATH = self.get_dem_path()
@@ -246,12 +268,3 @@ class TabDem(QWidget):
         cfg.OUTPUT_POINT = self.get_outlet_point()
         cfg.OUTPUT_DIR = self.get_output_dir()
         cfg.update_output_paths()
-
-        # Event & GEE
-        if self.use_event.isChecked():
-            cfg.EVENT_START_UTC = self.event_dt.dateTime().toString("yyyy-MM-dd HH:mm")
-        else:
-            cfg.EVENT_START_UTC = None
-        cfg.IMERG_UTC_OFFSET_HOURS = self.utc_offset.value()
-        proj = self.gee_project.text().strip()
-        cfg.GEE_PROJECT = proj or None

@@ -25,15 +25,16 @@ import os
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget,
     QPushButton, QProgressBar, QPlainTextEdit,
-    QLabel, QGroupBox, QCheckBox, QMessageBox,
+    QGroupBox, QCheckBox, QMessageBox,
     QSizePolicy,
 )
 from qgis.PyQt.QtCore import Qt
 
 from ..bridge.config_bridge import OpmConfig
-from ..bridge.runner import OpmWorker
+from ..bridge.runner import OpmWorker, DemStepWorker
 from ..bridge.dependencies import missing as missing_deps
 from .dependency_dialog import DependencyDialog
+from .layer_utils import add_raster, add_vector, zoom_to_layer
 from .tab_dem import TabDem
 from .tab_precip import TabPrecip
 from .tab_runoff import TabRunoff
@@ -55,6 +56,7 @@ class OpmMainDialog(QDialog):
         super().__init__(parent)
         self._iface = iface
         self._worker = None
+        self._dem_worker = None   # background worker for the guided DEM steps
 
         self.setWindowTitle("VSA-OPM Hydrological Model")
         self.setMinimumSize(780, 680)
@@ -188,6 +190,125 @@ class OpmMainDialog(QDialog):
         self.save_cfg_btn.clicked.connect(self._on_save_config)
         self.deps_btn.clicked.connect(self._open_dependencies)
 
+        # Guided DEM workflow (Tab 1) — the tab only requests a step; the dialog
+        # runs it off-thread and loads the resulting layers.
+        self.tab_dem.request_analyze_terrain.connect(self._on_analyze_terrain)
+        self.tab_dem.request_delineate.connect(self._on_delineate)
+
+        # Keep the Earth Engine project id in sync across the Precip & Runoff tabs
+        # (one config value, shown in two places).
+        self.tab_precip.gee_project.textChanged.connect(self._sync_gee_project)
+        self.tab_runoff._gee_project.textChanged.connect(self._sync_gee_project)
+
+    def _sync_gee_project(self, text):
+        """Mirror the GEE project id between the Precip and Runoff tabs."""
+        for widget in (self.tab_precip.gee_project, self.tab_runoff._gee_project):
+            if widget.text() != text:
+                widget.blockSignals(True)
+                widget.setText(text)
+                widget.blockSignals(False)
+
+    # ── Guided DEM workflow ────────────────────────────────────────────────────
+
+    def _on_analyze_terrain(self):
+        """Run outlet-independent terrain analysis, then draw streams on the map."""
+        if not self._deps_ok():
+            return
+        dem = self.tab_dem.get_dem_path()
+        out = self.tab_dem.get_output_dir()
+        if not dem or not os.path.exists(dem):
+            QMessageBox.warning(self, "No DEM", "Select a valid DEM file first.")
+            return
+        if not out:
+            QMessageBox.warning(self, "No output directory",
+                                "Choose an output directory first.")
+            return
+        params = {
+            "dem_path": dem,
+            "target_crs_epsg": self.tab_dem.get_target_crs(),
+            "output_dir": out,
+        }
+        self._start_dem_step("analyze_terrain", params)
+
+    def _on_delineate(self):
+        """Snap the picked outlet to the stream network and delineate the watershed."""
+        if not self._deps_ok():
+            return
+        out = self.tab_dem.get_output_dir()
+        if not out or not os.path.exists(os.path.join(out, "flow_direction.tif")):
+            QMessageBox.warning(self, "Analyze terrain first",
+                                "Run “Analyze terrain” before delineating the watershed.")
+            return
+        lat, lon = self.tab_dem.get_outlet_point()
+        params = {
+            "output_dir": out,
+            "output_point_latlon": (lat, lon),
+            "target_crs_epsg": self.tab_dem.get_target_crs(),
+        }
+        self._start_dem_step("delineate", params)
+
+    def _start_dem_step(self, task, params):
+        """Spawn the background DEM-step worker and route its signals."""
+        self.log_panel.clear()
+        self.run_btn.setEnabled(False)
+        self.tab_dem.set_busy(True)
+        self.progress_bar.setRange(0, 0)   # indeterminate/busy
+
+        self._dem_worker = DemStepWorker(task, params, parent=self)
+        self._dem_worker.log.connect(self._append_log)
+        self._dem_worker.finished.connect(self._on_dem_step_finished)
+        self._dem_worker.error.connect(self._on_dem_step_error)
+        self._dem_worker.start()
+
+    def _end_dem_step(self):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.run_btn.setEnabled(True)
+        self.tab_dem.set_busy(False)
+
+    def _on_dem_step_finished(self, result: dict):
+        self._end_dem_step()
+        task = result.get("task")
+        if task == "analyze_terrain":
+            dem = add_raster(result.get("reprojected_dem"), "DEM (reprojected)")
+            add_raster(result.get("flow_accumulation"), "Flow accumulation")
+            streams = add_vector(result.get("streams"), "Streams")
+            zoom_to_layer(self._iface, streams or dem)
+            self.tab_dem.set_terrain_ready(True)
+            self.tab_dem.activate_pick()
+            self._append_log("\n✅  Terrain ready — pick your outlet on a stream.")
+            self._iface.messageBar().pushInfo(
+                "VSA-OPM", "Streams drawn — pick your outlet on a stream, then Delineate.")
+        elif task == "delineate":
+            ws = add_vector(result.get("watershed_geojson"), "Watershed boundary")
+            zoom_to_layer(self._iface, ws)
+            self._append_log("\n✅  Watershed delineated.")
+            self._iface.messageBar().pushSuccess(
+                "VSA-OPM", "Watershed delineated — you can now run Routing.")
+
+    def _on_dem_step_error(self, message: str):
+        self._end_dem_step()
+        self._append_log(f"\n❌  ERROR: {message}")
+        self._iface.messageBar().pushCritical("VSA-OPM", message.splitlines()[0])
+        QMessageBox.critical(self, "VSA-OPM — DEM Step Error", message)
+
+    def _deps_ok(self) -> bool:
+        """Guard: ensure required Python packages are installed; offer the installer."""
+        miss = missing_deps(include_optional=False)
+        if not miss:
+            return True
+        names = ", ".join(m[1] for m in miss)
+        resp = QMessageBox.question(
+            self, "Missing Python packages",
+            f"The model needs these packages, which are not installed in "
+            f"QGIS's Python:\n\n    {names}\n\n"
+            "Open the Dependencies manager to install them now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if resp == QMessageBox.Yes:
+            self._open_dependencies()
+        return False
+
     # ── Run / Cancel ──────────────────────────────────────────────────────────
 
     def _on_run(self):
@@ -195,18 +316,7 @@ class OpmMainDialog(QDialog):
         # ── Dependency guard ──────────────────────────────────────────────────
         # Catch missing packages up-front so users get a guided installer instead
         # of a cryptic "ModuleNotFoundError: No module named 'rasterio'".
-        miss = missing_deps(include_optional=False)
-        if miss:
-            names = ", ".join(m[1] for m in miss)
-            resp = QMessageBox.question(
-                self, "Missing Python packages",
-                f"The model needs these packages, which are not installed in "
-                f"QGIS's Python:\n\n    {names}\n\n"
-                "Open the Dependencies manager to install them now?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if resp == QMessageBox.Yes:
-                self._open_dependencies()
+        if not self._deps_ok():
             return
 
         cfg = self._collect_config()

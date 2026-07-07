@@ -17,7 +17,7 @@ current choices are shown:
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QGroupBox, QComboBox,
     QDoubleSpinBox, QSpinBox, QLabel, QStackedWidget, QCheckBox,
-    QScrollArea, QHBoxLayout, QFrame,
+    QScrollArea, QHBoxLayout, QFrame, QLineEdit,
 )
 from qgis.gui import QgsFileWidget
 
@@ -70,6 +70,23 @@ class TabRunoff(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         form_mode.addRow("Mode:", self.mode_combo)
         root.addWidget(grp_mode)
+
+        # Earth Engine project — only used when a VSA-OPM satellite source is
+        # selected (SD=GEE, gridded Ksat, texture suction, LULC/LCZ Manning's n
+        # or impervious).  Mirrors the same field on the Precipitation tab; the
+        # event date lives there.  Blank is fine for gauge/manual runs.
+        grp_ee = QGroupBox("Earth Engine  (only for satellite soil / land-cover sources)")
+        form_ee = QFormLayout(grp_ee)
+        self._gee_project = QLineEdit()
+        self._gee_project.setPlaceholderText(
+            "ee-yourusername  (shared with the Precipitation tab)")
+        self._gee_project.setToolTip(
+            "Google Earth Engine cloud project ID.  Needed when a VSA-OPM source\n"
+            "downloads satellite data (SERVES deficit, gridded Ksat, SoilGrids\n"
+            "texture, LULC/LCZ).  Kept in sync with the Precipitation tab."
+        )
+        form_ee.addRow("GEE project:", self._gee_project)
+        root.addWidget(grp_ee)
 
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_none_panel())         # 0
@@ -373,6 +390,9 @@ class TabRunoff(QWidget):
         if getattr(cfg, "IMPERVIOUS_RASTER_PATH", None):
             self._imperv_raster.setFilePath(cfg.IMPERVIOUS_RASTER_PATH)
 
+        if getattr(cfg, "GEE_PROJECT", None):
+            self._gee_project.setText(str(cfg.GEE_PROJECT))
+
         self._apply_disclosure()
 
     def write_to_config(self, cfg):
@@ -413,6 +433,9 @@ class TabRunoff(QWidget):
         else:
             cfg.IMPERVIOUS_SOURCE = "none"
             cfg.IMPERVIOUS_RASTER_PATH = None
+
+        # Earth Engine project (kept in sync with the Precipitation tab).
+        cfg.GEE_PROJECT = self._gee_project.text().strip() or None
 
     @staticmethod
     def _idx(options, value):
