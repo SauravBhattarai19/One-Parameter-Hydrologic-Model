@@ -1,4 +1,5 @@
 import os
+import sys
 import rasterio
 import rasterio.features
 from rasterio.warp import calculate_default_transform, reproject, Resampling
@@ -12,7 +13,45 @@ if not hasattr(np, 'in1d'):
     np.in1d = np.isin
 
 import warnings
-from pysheds.grid import Grid
+
+
+def _import_pysheds_grid():
+    """Import pysheds' Grid, tolerating a too-old numba on the host Python.
+
+    pysheds JIT-compiles its kernels with numba.  Some bundled interpreters ship
+    a numba that is too old for their own Python — e.g. QGIS-LTR on macOS bundles
+    numba 0.50.1, which cannot compile the ``LIST_EXTEND`` bytecode emitted by
+    Python 3.9, so ``from pysheds.grid import Grid`` raises at import time.  When
+    that happens we switch numba to pure-Python mode (``DISABLE_JIT``) and retry:
+    pysheds then runs interpreted — slower, but with identical results — instead
+    of crashing the DEM stage.  On a healthy environment the first import
+    succeeds and JIT stays on, so nothing changes.
+    """
+    try:
+        from pysheds.grid import Grid
+        return Grid
+    except Exception as exc:  # noqa: BLE001 — numba compile errors, etc.
+        try:
+            import numba
+            numba.config.DISABLE_JIT = True
+        except Exception:
+            raise exc   # no numba to fall back on — re-raise the original error
+        # Drop the half-imported pysheds modules so its @njit decorators re-run
+        # in disabled mode on the retry below.
+        for _m in [m for m in list(sys.modules)
+                   if m == "pysheds" or m.startswith("pysheds.")]:
+            del sys.modules[_m]
+        pyver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        nbver = getattr(numba, "__version__", "?")
+        print(f"[WARN] This interpreter's numba ({nbver}) cannot JIT-compile "
+              f"pysheds on Python {pyver} ({type(exc).__name__}).  "
+              f"Running pysheds in pure-Python compatibility mode — results are "
+              f"identical, only slower (a one-time DEM step).")
+        from pysheds.grid import Grid
+        return Grid
+
+
+Grid = _import_pysheds_grid()
 
 # Suppress numba warnings from pysheds
 warnings.filterwarnings("ignore", message="The TBB threading layer requires TBB version")
